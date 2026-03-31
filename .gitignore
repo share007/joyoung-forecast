@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Local data and runtime artifacts
+backend/data/forecast.db
+backend/data/*.db
+*.log
+
+# Dataset files
+*.xlsx
+*.xls
+# *.csv

@@ -1,0 +1,47 @@
+:root {
+  --jy-bg: #fff9f2;
+  --jy-surface: #ffffff;
+  --jy-surface-soft: #fff3df;
+  --jy-primary: #f39800;
+  --jy-primary-deep: #dc7f00;
+  --jy-primary-soft: #ffdca3;
+  --jy-accent: #ff5a1f;
+  --jy-ok: #2f9e44;
+  --jy-border: #f2d7ad;
+  --jy-text: #2b1b08;
+  --jy-muted: #8a6b42;
+  --jy-danger: #d9480f;
+  --shadow-card: 0 10px 30px rgba(243, 152, 0, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  background:
+    radial-gradient(circle at 10% 10%, rgba(255, 214, 130, 0.35), transparent 36%),
+    radial-gradient(circle at 85% 15%, rgba(255, 157, 102, 0.18), transparent 36%),
+    var(--jy-bg);
+  color: var(--jy-text);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+.card {
+  background: var(--jy-surface);
+  border: 1px solid var(--jy-border);
+  box-shadow: var(--shadow-card);
+}
