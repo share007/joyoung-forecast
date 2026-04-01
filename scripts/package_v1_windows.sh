@@ -23,6 +23,9 @@ rsync -a --delete \
   --exclude 'data/forecast.db' \
   "$ROOT_DIR/backend/" "$APP_DIR/app/backend/"
 
+# Windows often fails to install LightGBM in user environments.
+awk '!/^[[:space:]]*lightgbm==/' "$APP_DIR/app/backend/requirements.txt" > "$APP_DIR/app/backend/requirements-windows.txt"
+
 printf "\n[4/6] Copying static frontend into backend/static_app...\n"
 mkdir -p "$APP_DIR/app/backend/static_app"
 rsync -a --delete "$ROOT_DIR/frontend/out/" "$APP_DIR/app/backend/static_app/"
@@ -33,7 +36,10 @@ setlocal enabledelayedexpansion
 
 set "BASE_DIR=%~dp0"
 set "APP_DIR=%BASE_DIR%app"
+set "FORECAST_DB_PATH=%APP_DIR%\data\forecast.db"
 cd /d "%APP_DIR%"
+
+if not exist "%APP_DIR%\data" mkdir "%APP_DIR%\data"
 
 where py >nul 2>nul
 if %errorlevel%==0 (
@@ -57,6 +63,15 @@ if not exist ".venv\Scripts\python.exe" (
 call ".venv\Scripts\activate.bat"
 python -m pip install --upgrade pip >nul 2>nul
 python -m pip install -r backend\requirements.txt
+if %errorlevel% neq 0 (
+  echo [WARN] Full dependency install failed. Retrying with Windows-compatible set...
+  python -m pip install -r backend\requirements-windows.txt
+  if %errorlevel% neq 0 (
+    echo [ERROR] Dependency install failed. Please check network or app\app.log
+    pause
+    exit /b 1
+  )
+)
 
 if exist app.pid (
   set /p OLD_PID=<app.pid
@@ -83,10 +98,24 @@ if defined NEW_PID (
   echo !NEW_PID!>app.pid
 )
 
-timeout /t 2 >nul
+set /a RETRIES=30
+:wait_api
+powershell -NoProfile -Command "try { $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/' -UseBasicParsing -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"
+if !errorlevel!==0 goto api_ready
+set /a RETRIES-=1
+if !RETRIES! LEQ 0 goto api_timeout
+timeout /t 1 >nul
+goto wait_api
+
+:api_ready
 start "" "http://127.0.0.1:8000/home/forecast/dashboard/"
 echo App started. Log file: %APP_DIR%\app.log
 exit /b 0
+
+:api_timeout
+echo [ERROR] App did not become ready in time. Please check app\app.log
+pause
+exit /b 1
 EOF
 
 cat > "$APP_DIR/stop.bat" <<'EOF'
