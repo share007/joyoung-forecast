@@ -1,0 +1,35 @@
+name: Build Windows EXE Package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'V*'
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build EXE package
+        shell: pwsh
+        run: ./scripts/package_v1_windows_exe.ps1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JoyoungForecast-V1.0-Windows-EXE
+          path: dist/JoyoungForecast-V1.0-Windows-EXE.zip

@@ -4,6 +4,7 @@
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import json
@@ -593,3 +594,9 @@ def forecast_monthly(request: MonthlyForecastRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+STATIC_APP_DIR = os.path.join(os.path.dirname(__file__), "static_app")
+if os.path.isdir(STATIC_APP_DIR):
+    # Mounted last so explicit API routes keep higher priority.
+    app.mount("/", StaticFiles(directory=STATIC_APP_DIR, html=True), name="frontend")

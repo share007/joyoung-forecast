@@ -7,7 +7,8 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'forecast.db')
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'forecast.db')
+DB_PATH = os.environ.get('FORECAST_DB_PATH', DEFAULT_DB_PATH)
 
 def get_db():
     """获取数据库连接"""

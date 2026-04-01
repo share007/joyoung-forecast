@@ -23,6 +23,8 @@ frontend/out/
 backend/data/forecast.db
 backend/data/*.db
 *.log
+dist/
+.venv-build-exe/
 
 # Dataset files
 *.xlsx
