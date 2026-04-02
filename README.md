@@ -105,39 +105,6 @@
 
 启动后访问 http://localhost:3000。
 
-## Docker 开箱即用（前后端一键启动）
-
-本仓库已提供完整容器化文件：
-
-- 根目录 `docker-compose.yml`
-- 后端 `backend/Dockerfile`
-- 前端 `frontend/Dockerfile`
-
-### 启动
-
-1. 安装 Docker 与 Docker Compose
-2. 在项目根目录执行：
-
-```bash
-docker compose up -d --build
-```
-
-### 访问
-
-- 前端: http://localhost:3000/home/forecast/dashboard
-- 后端: http://localhost:8000
-
-### 停止
-
-```bash
-docker compose down
-```
-
-说明：
-
-- SQLite 数据持久化目录为 `backend/data`，重启容器不会丢失。
-- 前端与后端均已封装，用户无需本地安装 Python/Node 环境即可使用。
-
 ### 主题说明
 
 前端已切换为九阳品牌风格，主色采用橙金体系：
