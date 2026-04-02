@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
+from datetime import datetime
 import json
 import ast
 import os
@@ -21,7 +22,12 @@ from database import (
     bulk_add_sales_data, save_forecast_result, get_latest_forecast,
     create_import_batch, save_planning_result, get_recent_import_batches,
     save_latest_import_file, get_latest_import_file, upsert_products_by_codes,
-    begin_latest_import_file, append_latest_import_rows, finalize_latest_import_file
+    begin_latest_import_file, append_latest_import_rows, finalize_latest_import_file,
+    list_import_files, delete_import_file, get_all_import_rows,
+    save_or_replace_daily_monthly_forecast, get_monthly_forecast_runs,
+    clear_monthly_forecast_runs, upsert_material_lifecycle,
+    list_material_lifecycle, get_material_lifecycle_map,
+    delete_material_lifecycle_by_ids,
 )
 from services.forecasting import forecast_with_champion_challenger
 from services.importer import parse_upload_file, infer_column_mapping, normalize_raw_df, rows_to_json_ready
@@ -73,6 +79,16 @@ class MonthlyForecastRequest(BaseModel):
     """按产品编码-月份预测请求（默认未来3个月）"""
     forecast_months: int = 3
     column_mapping: Optional[dict] = None
+
+
+class MaterialLifecycleItem(BaseModel):
+    product_code: str
+    listing_date: Optional[str] = None
+    delisting_date: Optional[str] = None
+
+
+class MaterialDeleteRequest(BaseModel):
+    ids: List[int]
 
 
 def _json_safe(value):
@@ -167,7 +183,7 @@ def forecast(request: ForecastRequest):
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """上传销售数据文件（支持任意字段），系统只保留最近一次导入"""
+    """上传销售数据文件（支持任意字段），每次导入都会生成独立记录"""
     try:
         filename = file.filename or 'uploaded_file'
 
@@ -551,44 +567,252 @@ def get_latest_import():
     }
 
 
+@app.get('/imports')
+def get_imports():
+    """查询全部导入记录（未删除）"""
+    files = list_import_files(limit=1000)
+    return {
+        'success': True,
+        'count': len(files),
+        'files': [
+            {
+                'id': item.get('id'),
+                'file_name': item.get('file_name'),
+                'sheet_name': item.get('sheet_name'),
+                'source_type': item.get('source_type'),
+                'row_count': item.get('row_count', 0),
+                'columns': item.get('columns', []),
+                'detected_columns': item.get('detected_columns', {}),
+                'created_at': item.get('created_at'),
+            }
+            for item in files
+        ],
+    }
+
+
+@app.delete('/imports/{import_file_id}')
+def remove_import(import_file_id: int):
+    """删除导入记录，并清空该记录对应的导入数据"""
+    ok = delete_import_file(import_file_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail='导入记录不存在或已删除')
+    return {
+        'success': True,
+        'deleted_import_file_id': import_file_id,
+    }
+
+
 @app.post('/forecast/monthly')
 def forecast_monthly(request: MonthlyForecastRequest):
-    """基于最近一次导入的数据，输出未来N个月的 产品编码-月份-销量 预测。"""
+    """基于所有未删除导入数据，输出未来N个月的 产品编码-月份-销量 预测。"""
     if request.forecast_months < 1 or request.forecast_months > 12:
         raise HTTPException(status_code=400, detail='forecast_months 应在 1-12 之间')
 
-    latest = get_latest_import_file()
-    if not latest:
+    import_files = list_import_files(limit=1000)
+    if not import_files:
         raise HTTPException(status_code=404, detail='尚未导入数据文件，请先调用 /upload')
 
-    rows = latest.get('rows', [])
+    rows = get_all_import_rows()
     if not rows:
-        raise HTTPException(status_code=400, detail='最近一次导入文件没有可用数据')
+        raise HTTPException(status_code=400, detail='当前导入文件没有可用数据')
 
     try:
+        lifecycle_map = get_material_lifecycle_map()
         output = forecast_next_months(
             raw_rows=rows,
             forecast_months=request.forecast_months,
             column_mapping=request.column_mapping,
+            lifecycle_map=lifecycle_map,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    algorithm = {
+        'strategy': 'Champion-Challenger（全局LightGBM vs 统计基线）',
+        'selection_metric': 'WMAPE（时间顺序回测）',
+        'selected_method': output.metrics.get('selected_method'),
+    }
+
+    now = datetime.now()
+    run_date = f'{now.year}/{now.month}/{now.day}'
+    completed_at = now.strftime('%Y-%m-%d %H:%M:%S')
+    run_id = save_or_replace_daily_monthly_forecast(
+        run_date=run_date,
+        source_file_count=len(import_files),
+        source_row_count=len(rows),
+        mapping=output.mapping,
+        metrics=output.metrics,
+        algorithm=algorithm,
+        rows=output.rows,
+        completed_at=completed_at,
+    )
+
     return _json_safe({
         'success': True,
-        'source_file': latest.get('file_name'),
+        'run_id': run_id,
+        'run_date': run_date,
+        'run_completed_at': completed_at,
+        'source_files': [item.get('file_name') for item in import_files],
+        'source_file_count': len(import_files),
+        'source_row_count': len(rows),
         'forecast_months': request.forecast_months,
         'mapping': output.mapping,
-        'algorithm': {
-            'strategy': 'Champion-Challenger（全局LightGBM vs 统计基线）',
-            'selection_metric': 'WMAPE（时间顺序回测）',
-            'selected_method': output.metrics.get('selected_method'),
-        },
+        'algorithm': algorithm,
         'metrics': output.metrics,
         'data': output.rows,
         'output_columns': ['product_code', 'month', 'sales'],
         'interval_columns': ['lower_bound', 'upper_bound'],
     })
+
+
+@app.get('/forecast/monthly/runs')
+def forecast_monthly_runs(limit: int = 30):
+    """获取按运行日期保留的月度预测结果（每天只保留最后一次）"""
+    runs = get_monthly_forecast_runs(limit=limit)
+    return _json_safe({
+        'success': True,
+        'count': len(runs),
+        'runs': [
+            {
+                'id': item.get('id'),
+                'run_date': item.get('run_date'),
+                'created_at': item.get('created_at'),
+                'source_file_count': item.get('source_file_count', 0),
+                'source_row_count': item.get('source_row_count', 0),
+                'mapping': item.get('mapping', {}),
+                'algorithm': item.get('algorithm', {}),
+                'metrics': item.get('metrics', {}),
+                'data': item.get('rows', []),
+            }
+            for item in runs
+        ],
+    })
+
+
+@app.delete('/forecast/monthly/runs')
+def clear_forecast_monthly_runs():
+    deleted = clear_monthly_forecast_runs()
+    return {
+        'success': True,
+        'deleted_runs': deleted,
+    }
+
+
+@app.get('/materials')
+def get_materials(limit: int = 5000, product_code: Optional[str] = None):
+    items = list_material_lifecycle(limit=limit, product_code_keyword=product_code)
+    return {
+        'success': True,
+        'count': len(items),
+        'items': items,
+    }
+
+
+@app.post('/materials')
+def upsert_materials(items: List[MaterialLifecycleItem]):
+    payload = [
+        {
+            'product_code': item.product_code,
+            'listing_date': item.listing_date,
+            'delisting_date': item.delisting_date,
+        }
+        for item in items
+    ]
+    count = upsert_material_lifecycle(payload)
+    return {
+        'success': True,
+        'upserted_count': count,
+    }
+
+
+@app.post('/materials/upload')
+async def upload_materials(file: UploadFile = File(...)):
+    filename = file.filename or 'materials_file'
+
+    try:
+        if filename.lower().endswith('.csv'):
+            file.file.seek(0)
+            df = pd.read_csv(file.file)
+        elif filename.lower().endswith(('.xlsx', '.xls')):
+            content = await file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail='文件内容为空')
+            df = pd.read_excel(BytesIO(content))
+        else:
+            raise HTTPException(status_code=400, detail='仅支持 CSV/XLS/XLSX')
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f'读取文件失败: {exc}')
+
+    if df is None or df.empty:
+        raise HTTPException(status_code=400, detail='文件没有可导入数据')
+
+    normalized = {str(col).strip(): col for col in df.columns}
+
+    def find_col(candidates: List[str]) -> Optional[str]:
+        lower_map = {k.lower(): v for k, v in normalized.items()}
+        for cand in candidates:
+            if cand.lower() in lower_map:
+                return lower_map[cand.lower()]
+        for key, original in normalized.items():
+            lk = key.lower()
+            if any(cand.lower() in lk for cand in candidates):
+                return original
+        return None
+
+    code_col = find_col(['物料编码', '产品编码', 'material_code', 'product_code', 'sku'])
+    listing_col = find_col(['上市时间', '上市日期', 'listing_date', 'start_date'])
+    delisting_col = find_col(['下市时间', '下市日期', 'delisting_date', 'end_date'])
+
+    if not code_col:
+        raise HTTPException(status_code=400, detail='未找到物料编码列')
+
+    rows: List[Dict] = []
+    for _, row in df.iterrows():
+        code = str(row.get(code_col, '')).strip()
+        if not code or code.lower() == 'nan':
+            continue
+
+        listing_raw = row.get(listing_col) if listing_col else None
+        delisting_raw = row.get(delisting_col) if delisting_col else None
+
+        listing_val = None
+        delisting_val = None
+
+        if listing_raw is not None and str(listing_raw).strip() and str(listing_raw).lower() != 'nan':
+            listing_val = pd.to_datetime(listing_raw, errors='coerce')
+            listing_val = listing_val.strftime('%Y-%m-%d') if pd.notna(listing_val) else None
+        if delisting_raw is not None and str(delisting_raw).strip() and str(delisting_raw).lower() != 'nan':
+            delisting_val = pd.to_datetime(delisting_raw, errors='coerce')
+            delisting_val = delisting_val.strftime('%Y-%m-%d') if pd.notna(delisting_val) else None
+
+        rows.append(
+            {
+                'product_code': code,
+                'listing_date': listing_val,
+                'delisting_date': delisting_val,
+            }
+        )
+
+    if not rows:
+        raise HTTPException(status_code=400, detail='没有可导入的物料基础数据')
+
+    count = upsert_material_lifecycle(rows)
+    return {
+        'success': True,
+        'file_name': filename,
+        'upserted_count': count,
+    }
+
+
+@app.post('/materials/delete')
+def delete_materials(request: MaterialDeleteRequest):
+    deleted = delete_material_lifecycle_by_ids(request.ids)
+    return {
+        'success': True,
+        'deleted_count': deleted,
+    }
 
 
 if __name__ == "__main__":

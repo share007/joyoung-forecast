@@ -23,6 +23,7 @@ frontend/out/
 backend/data/forecast.db
 backend/data/*.db
 *.log
+.dev_pids
 dist/
 .venv-build-exe/
 

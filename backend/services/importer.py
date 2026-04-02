@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from io import BytesIO, StringIO
+import math
 import re
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import numpy as np
 
 @dataclass
 class ParsedUpload:
@@ -120,10 +123,38 @@ def infer_column_mapping(df: pd.DataFrame, override: Optional[Dict[str, str]] = 
 
 
 def rows_to_json_ready(df: pd.DataFrame) -> List[Dict]:
-    # Keep all incoming columns and values while making NaN/Inf JSON-safe.
-    safe = df.replace([float("inf"), float("-inf")], None)
-    safe = safe.where(pd.notnull(safe), None)
-    return safe.to_dict("records")
+    # Convert all values to JSON-safe primitives to avoid intermittent
+    # Timestamp/numpy serialization errors during import persistence.
+    def scalar_to_json_safe(value):
+        if value is None:
+            return None
+
+        if isinstance(value, np.generic):
+            value = value.item()
+
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if isinstance(value, pd.Timedelta):
+            return str(value)
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+
+        if pd.isna(value):
+            return None
+
+        return value
+
+    safe_records: List[Dict] = []
+    columns = [str(col) for col in df.columns]
+    for row in df.itertuples(index=False, name=None):
+        record: Dict[str, object] = {}
+        for idx, value in enumerate(row):
+            record[columns[idx]] = scalar_to_json_safe(value)
+        safe_records.append(record)
+    return safe_records
 
 
 def parse_upload_file(filename: str, content: bytes, preferred_sheet: Optional[str] = None) -> ParsedUpload:

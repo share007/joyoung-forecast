@@ -13,20 +13,35 @@ export default function ForecastHomePage() {
         }}
       >
         <h2 style={{ marginTop: 0 }}>产销预测模块</h2>
-        <p style={{ color: 'var(--jy-muted)' }}>点击下方按钮进入仪表盘。</p>
-        <Link
-          href="/home/forecast/dashboard"
-          style={{
-            display: 'inline-block',
-            padding: '10px 16px',
-            borderRadius: 10,
-            background: 'var(--jy-primary)',
-            color: '#fff',
-            fontWeight: 700,
-          }}
-        >
-          打开仪表盘
-        </Link>
+        <p style={{ color: 'var(--jy-muted)' }}>请选择要进入的功能页面。</p>
+        <section style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+          <Link
+            href="/home/forecast/dashboard"
+            style={{
+              display: 'inline-block',
+              padding: '10px 16px',
+              borderRadius: 10,
+              background: 'var(--jy-primary)',
+              color: '#fff',
+              fontWeight: 700,
+            }}
+          >
+            打开仪表盘
+          </Link>
+          <Link
+            href="/home/forecast/materials"
+            style={{
+              display: 'inline-block',
+              padding: '10px 16px',
+              borderRadius: 10,
+              border: '1px solid var(--jy-border, #efd8b0)',
+              color: 'var(--jy-muted, #7f6a4a)',
+              fontWeight: 700,
+            }}
+          >
+            商品基础数据导入
+          </Link>
+        </section>
       </section>
     </main>
   )

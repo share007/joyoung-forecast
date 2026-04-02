@@ -34,6 +34,7 @@ def _wmape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def _prepare_daily(
     raw_rows: List[Dict],
     column_mapping: Optional[Dict[str, str]] = None,
+    lifecycle_map: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, str], List[str], List[str]]:
     if not raw_rows:
         raise ValueError("没有可用的导入数据")
@@ -68,6 +69,26 @@ def _prepare_daily(
     work["date"] = pd.to_datetime(work["date"], errors="coerce")
     work["sales"] = pd.to_numeric(work["sales"], errors="coerce").clip(lower=0)
     work = work.dropna(subset=["product_code", "date", "sales"])
+
+    if lifecycle_map:
+        filtered_frames: List[pd.DataFrame] = []
+        for code, grp in work.groupby("product_code"):
+            lifecycle = lifecycle_map.get(str(code), {})
+            start_raw = lifecycle.get("listing_date") if lifecycle else None
+            end_raw = lifecycle.get("delisting_date") if lifecycle else None
+            start = pd.to_datetime(start_raw, errors="coerce") if start_raw else None
+            end = pd.to_datetime(end_raw, errors="coerce") if end_raw else None
+
+            local = grp
+            if start is not None and pd.notna(start):
+                local = local[local["date"] >= start]
+            if end is not None and pd.notna(end):
+                local = local[local["date"] <= end]
+
+            if not local.empty:
+                filtered_frames.append(local)
+
+        work = pd.concat(filtered_frames, ignore_index=True) if filtered_frames else pd.DataFrame(columns=work.columns)
 
     if work.empty:
         raise ValueError("导入数据没有可用于预测的有效记录")
@@ -416,11 +437,16 @@ def forecast_next_months(
     raw_rows: List[Dict],
     forecast_months: int = 3,
     column_mapping: Optional[Dict[str, str]] = None,
+    lifecycle_map: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
 ) -> MonthlyForecastOutput:
     # Business requirement fixed at 3 months: current month + next two months.
     forecast_months = 3
 
-    daily, mapping, numeric_cols, cat_cols = _prepare_daily(raw_rows, column_mapping=column_mapping)
+    daily, mapping, numeric_cols, cat_cols = _prepare_daily(
+        raw_rows,
+        column_mapping=column_mapping,
+        lifecycle_map=lifecycle_map,
+    )
     daily = _add_calendar_features(daily)
     daily, encoded_cat_cols, _ = _encode_categories(daily, cat_cols)
     related_numeric = _select_related_features(daily, numeric_cols)
@@ -456,6 +482,36 @@ def forecast_next_months(
     selected_daily = pred_lgb if use_lgb else pred_base
 
     rows = _aggregate_monthly(daily[["product_code", "date", "sales"]], selected_daily)
+
+    if lifecycle_map:
+        adjusted_rows: List[Dict] = []
+        for row in rows:
+            code = str(row.get("product_code"))
+            month = pd.Period(str(row.get("month")), freq="M")
+            lifecycle = lifecycle_map.get(code, {})
+            start_raw = lifecycle.get("listing_date") if lifecycle else None
+            end_raw = lifecycle.get("delisting_date") if lifecycle else None
+            start = pd.to_datetime(start_raw, errors="coerce") if start_raw else None
+            end = pd.to_datetime(end_raw, errors="coerce") if end_raw else None
+
+            month_start = month.to_timestamp(how="start")
+            month_end = month.to_timestamp(how="end").normalize()
+
+            active = True
+            if start is not None and pd.notna(start) and month_end < start:
+                active = False
+            if end is not None and pd.notna(end) and month_start > end:
+                active = False
+
+            if not active:
+                adjusted = dict(row)
+                adjusted["sales"] = 0.0
+                adjusted["lower_bound"] = 0.0
+                adjusted["upper_bound"] = 0.0
+                adjusted_rows.append(adjusted)
+            else:
+                adjusted_rows.append(row)
+        rows = adjusted_rows
 
     now_month = pd.Timestamp.today().to_period("M")
     return MonthlyForecastOutput(

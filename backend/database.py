@@ -4,11 +4,20 @@
 import sqlite3
 import os
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Dict, Optional
 
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'forecast.db')
 DB_PATH = os.environ.get('FORECAST_DB_PATH', DEFAULT_DB_PATH)
+
+
+def _json_dumps_safe(value) -> str:
+    def _default(obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        return str(obj)
+
+    return json.dumps(value, ensure_ascii=False, default=_default)
 
 def get_db():
     """获取数据库连接"""
@@ -109,6 +118,43 @@ def init_db():
             row_index INTEGER NOT NULL,
             row_data TEXT NOT NULL,
             FOREIGN KEY (import_file_id) REFERENCES latest_import_files(id)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS monthly_forecast_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_date TEXT NOT NULL UNIQUE,
+            source_file_count INTEGER DEFAULT 0,
+            source_row_count INTEGER DEFAULT 0,
+            mapping_json TEXT,
+            metrics_json TEXT,
+            algorithm_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS monthly_forecast_run_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            product_code TEXT NOT NULL,
+            month TEXT NOT NULL,
+            sales REAL NOT NULL,
+            lower_bound REAL,
+            upper_bound REAL,
+            FOREIGN KEY (run_id) REFERENCES monthly_forecast_runs(id)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS material_lifecycle (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_code TEXT NOT NULL UNIQUE,
+            listing_date TEXT,
+            delisting_date TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -315,10 +361,6 @@ def save_latest_import_file(
     conn = get_db()
     cursor = conn.cursor()
 
-    # 仅保留最近一次导入数据
-    cursor.execute('DELETE FROM latest_import_rows')
-    cursor.execute('DELETE FROM latest_import_files')
-
     columns = list(rows[0].keys()) if rows else []
     cursor.execute(
         '''
@@ -339,7 +381,7 @@ def save_latest_import_file(
     for idx, row in enumerate(rows):
         cursor.execute(
             'INSERT INTO latest_import_rows (import_file_id, row_index, row_data) VALUES (?, ?, ?)',
-            (import_file_id, idx, json.dumps(row, ensure_ascii=False)),
+            (import_file_id, idx, _json_dumps_safe(row)),
         )
 
     conn.commit()
@@ -356,10 +398,6 @@ def begin_latest_import_file(
 ) -> int:
     conn = get_db()
     cursor = conn.cursor()
-
-    # Keep only the newest imported file snapshot.
-    cursor.execute('DELETE FROM latest_import_rows')
-    cursor.execute('DELETE FROM latest_import_files')
 
     cursor.execute(
         '''
@@ -392,7 +430,7 @@ def append_latest_import_rows(import_file_id: int, rows: List[Dict], start_index
         (
             import_file_id,
             start_index + idx,
-            json.dumps(row, ensure_ascii=False),
+            _json_dumps_safe(row),
         )
         for idx, row in enumerate(rows)
     ]
@@ -449,6 +487,296 @@ def get_latest_import_file() -> Optional[Dict]:
     file_dict['detected_columns'] = _safe_json_loads(file_dict.get('detected_columns_json')) or {}
     file_dict['rows'] = parsed_rows
     return file_dict
+
+
+def list_import_files(limit: int = 200) -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT id, file_name, sheet_name, source_type, row_count, columns_json, detected_columns_json, created_at
+        FROM latest_import_files
+        ORDER BY id DESC
+        LIMIT ?
+        ''',
+        (limit,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    files: List[Dict] = []
+    for row in rows:
+        item = dict(row)
+        item['columns'] = _safe_json_loads(item.get('columns_json')) or []
+        item['detected_columns'] = _safe_json_loads(item.get('detected_columns_json')) or {}
+        files.append(item)
+    return files
+
+
+def get_import_file_rows(import_file_id: int) -> Optional[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM latest_import_files WHERE id = ?', (import_file_id,))
+    file_row = cursor.fetchone()
+    if not file_row:
+        conn.close()
+        return None
+
+    cursor.execute(
+        'SELECT row_data FROM latest_import_rows WHERE import_file_id = ? ORDER BY row_index',
+        (import_file_id,),
+    )
+    row_items = cursor.fetchall()
+    conn.close()
+
+    file_dict = dict(file_row)
+    file_dict['columns'] = _safe_json_loads(file_dict.get('columns_json')) or []
+    file_dict['detected_columns'] = _safe_json_loads(file_dict.get('detected_columns_json')) or {}
+    file_dict['rows'] = [_safe_json_loads(item['row_data']) for item in row_items]
+    return file_dict
+
+
+def delete_import_file(import_file_id: int) -> bool:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM latest_import_files WHERE id = ?', (import_file_id,))
+    target = cursor.fetchone()
+    if not target:
+        conn.close()
+        return False
+
+    cursor.execute('DELETE FROM latest_import_rows WHERE import_file_id = ?', (import_file_id,))
+    cursor.execute('DELETE FROM latest_import_files WHERE id = ?', (import_file_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_all_import_rows() -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT r.row_data
+        FROM latest_import_rows r
+        JOIN latest_import_files f ON f.id = r.import_file_id
+        ORDER BY f.id ASC, r.row_index ASC
+        '''
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [_safe_json_loads(row['row_data']) for row in rows]
+
+
+def save_or_replace_daily_monthly_forecast(
+    run_date: str,
+    source_file_count: int,
+    source_row_count: int,
+    mapping: Dict,
+    metrics: Dict,
+    algorithm: Dict,
+    rows: List[Dict],
+    completed_at: Optional[str] = None,
+) -> int:
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT id FROM monthly_forecast_runs WHERE run_date = ?', (run_date,))
+    existing = cursor.fetchone()
+    if existing:
+        run_id = existing['id']
+        cursor.execute(
+            '''
+            UPDATE monthly_forecast_runs
+            SET source_file_count = ?, source_row_count = ?, mapping_json = ?, metrics_json = ?, algorithm_json = ?, created_at = ?
+            WHERE id = ?
+            ''',
+            (
+                source_file_count,
+                source_row_count,
+                json.dumps(mapping or {}, ensure_ascii=False),
+                json.dumps(metrics or {}, ensure_ascii=False),
+                json.dumps(algorithm or {}, ensure_ascii=False),
+                completed_at,
+                run_id,
+            ),
+        )
+        cursor.execute('DELETE FROM monthly_forecast_run_rows WHERE run_id = ?', (run_id,))
+    else:
+        cursor.execute(
+            '''
+            INSERT INTO monthly_forecast_runs (run_date, source_file_count, source_row_count, mapping_json, metrics_json, algorithm_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                run_date,
+                source_file_count,
+                source_row_count,
+                json.dumps(mapping or {}, ensure_ascii=False),
+                json.dumps(metrics or {}, ensure_ascii=False),
+                json.dumps(algorithm or {}, ensure_ascii=False),
+                completed_at,
+            ),
+        )
+        run_id = cursor.lastrowid
+
+    payload = [
+        (
+            run_id,
+            str(row.get('product_code', '')),
+            str(row.get('month', '')),
+            float(row.get('sales', 0) or 0),
+            float(row.get('lower_bound')) if row.get('lower_bound') is not None else None,
+            float(row.get('upper_bound')) if row.get('upper_bound') is not None else None,
+        )
+        for row in rows
+    ]
+    cursor.executemany(
+        '''
+        INSERT INTO monthly_forecast_run_rows (run_id, product_code, month, sales, lower_bound, upper_bound)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''',
+        payload,
+    )
+
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def get_monthly_forecast_runs(limit: int = 30) -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT * FROM monthly_forecast_runs
+        ORDER BY run_date DESC
+        LIMIT ?
+        ''',
+        (limit,),
+    )
+    run_rows = cursor.fetchall()
+
+    runs: List[Dict] = []
+    for run_row in run_rows:
+        run_item = dict(run_row)
+        cursor.execute(
+            '''
+            SELECT product_code, month, sales, lower_bound, upper_bound
+            FROM monthly_forecast_run_rows
+            WHERE run_id = ?
+            ORDER BY product_code ASC, month ASC
+            ''',
+            (run_item['id'],),
+        )
+        data_rows = [dict(item) for item in cursor.fetchall()]
+        run_item['mapping'] = _safe_json_loads(run_item.get('mapping_json')) or {}
+        run_item['metrics'] = _safe_json_loads(run_item.get('metrics_json')) or {}
+        run_item['algorithm'] = _safe_json_loads(run_item.get('algorithm_json')) or {}
+        run_item['rows'] = data_rows
+        runs.append(run_item)
+
+    conn.close()
+    return runs
+
+
+def clear_monthly_forecast_runs() -> int:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) AS cnt FROM monthly_forecast_runs')
+    row = cursor.fetchone()
+    total = int(row['cnt']) if row else 0
+    cursor.execute('DELETE FROM monthly_forecast_run_rows')
+    cursor.execute('DELETE FROM monthly_forecast_runs')
+    conn.commit()
+    conn.close()
+    return total
+
+
+def upsert_material_lifecycle(records: List[Dict]) -> int:
+    if not records:
+        return 0
+
+    conn = get_db()
+    cursor = conn.cursor()
+    count = 0
+    for item in records:
+        product_code = str(item.get('product_code', '')).strip()
+        if not product_code:
+            continue
+        listing_date = item.get('listing_date')
+        delisting_date = item.get('delisting_date')
+        cursor.execute(
+            '''
+            INSERT INTO material_lifecycle (product_code, listing_date, delisting_date, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(product_code) DO UPDATE SET
+                listing_date = excluded.listing_date,
+                delisting_date = excluded.delisting_date,
+                updated_at = CURRENT_TIMESTAMP
+            ''',
+            (product_code, listing_date, delisting_date),
+        )
+        count += 1
+
+    conn.commit()
+    conn.close()
+    return count
+
+
+def list_material_lifecycle(limit: int = 5000, product_code_keyword: Optional[str] = None) -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    if product_code_keyword:
+        cursor.execute(
+            '''
+            SELECT id, product_code, listing_date, delisting_date, created_at, updated_at
+            FROM material_lifecycle
+            WHERE product_code LIKE ?
+            ORDER BY product_code ASC
+            LIMIT ?
+            ''',
+            (f'%{product_code_keyword}%', limit),
+        )
+    else:
+        cursor.execute(
+            '''
+            SELECT id, product_code, listing_date, delisting_date, created_at, updated_at
+            FROM material_lifecycle
+            ORDER BY product_code ASC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def delete_material_lifecycle_by_ids(ids: List[int]) -> int:
+    clean_ids = [int(item) for item in ids if isinstance(item, int) or str(item).isdigit()]
+    if not clean_ids:
+        return 0
+
+    conn = get_db()
+    cursor = conn.cursor()
+    placeholders = ','.join(['?'] * len(clean_ids))
+    cursor.execute(f'DELETE FROM material_lifecycle WHERE id IN ({placeholders})', clean_ids)
+    deleted = cursor.rowcount if cursor.rowcount is not None else 0
+    conn.commit()
+    conn.close()
+    return int(deleted)
+
+
+def get_material_lifecycle_map() -> Dict[str, Dict[str, Optional[str]]]:
+    items = list_material_lifecycle(limit=200000)
+    return {
+        str(item.get('product_code')): {
+            'listing_date': item.get('listing_date'),
+            'delisting_date': item.get('delisting_date'),
+        }
+        for item in items
+    }
 
 
 def upsert_products_by_codes(product_codes: List[str]) -> int:
