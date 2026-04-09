@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 import importlib
+import re
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -41,16 +42,37 @@ def _parse_start_month(start_month: Optional[str]) -> pd.Period:
     return pd.Timestamp.today().to_period("M")
 
 
+def _detect_time_granularity(raw_date_series: pd.Series) -> str:
+    raw = raw_date_series.astype(str).str.strip()
+    month_like_ratio = raw.str.match(r"^\d{4}[-/]\d{1,2}$", na=False).mean()
+
+    parsed = pd.to_datetime(raw_date_series, errors="coerce")
+    valid = parsed.dropna()
+    if valid.empty:
+        return "daily"
+
+    unique_dates = int(valid.dt.normalize().nunique())
+    unique_months = int(valid.dt.to_period("M").nunique())
+    day_one_ratio = float((valid.dt.day == 1).mean())
+
+    if month_like_ratio >= 0.8:
+        return "monthly"
+    if day_one_ratio >= 0.95 and unique_months > 0 and unique_dates <= unique_months + 1:
+        return "monthly"
+    return "daily"
+
+
 def _prepare_daily(
     raw_rows: List[Dict],
     column_mapping: Optional[Dict[str, str]] = None,
     lifecycle_map: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, str], List[str], List[str]]:
+) -> Tuple[pd.DataFrame, Dict[str, str], List[str], List[str], str]:
     if not raw_rows:
         raise ValueError("没有可用的导入数据")
 
     df = pd.DataFrame(raw_rows)
     mapping = infer_column_mapping(df, override=column_mapping)
+    granularity = _detect_time_granularity(df[mapping["date"]])
 
     required = ["product_code", "date", "sales"]
     missing = [k for k in required if not mapping.get(k) or mapping[k] not in df.columns]
@@ -123,7 +145,13 @@ def _prepare_daily(
     for col in cat_cols:
         agg_spec[col] = lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[-1]
 
-    daily = work.groupby(["product_code", "date"], as_index=False).agg(agg_spec)
+    if granularity == "monthly":
+        work["month"] = work["date"].dt.to_period("M")
+        daily = work.groupby(["product_code", "month"], as_index=False).agg(agg_spec)
+        daily["date"] = daily["month"].dt.to_timestamp()
+        daily = daily.drop(columns=["month"])
+    else:
+        daily = work.groupby(["product_code", "date"], as_index=False).agg(agg_spec)
     daily = daily.sort_values(["product_code", "date"])
 
     mapping_result = {
@@ -131,7 +159,7 @@ def _prepare_daily(
         "date": mapping["date"],
         "sales": mapping["sales"],
     }
-    return daily, mapping_result, numeric_cols, cat_cols
+    return daily, mapping_result, numeric_cols, cat_cols, granularity
 
 
 def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -362,6 +390,47 @@ def _predict_baseline_daily(history: pd.DataFrame, start_month: pd.Period, forec
     return pd.DataFrame(out)
 
 
+def _predict_baseline_monthly(history: pd.DataFrame, start_month: pd.Period, forecast_months: int) -> List[Dict]:
+    month_range = pd.period_range(start_month, start_month + (forecast_months - 1), freq="M")
+    rows: List[Dict] = []
+
+    for code, grp in history.groupby("product_code"):
+        grp = grp.sort_values("date").copy()
+        grp["period"] = grp["date"].dt.to_period("M")
+        month_sales = {p: float(v) for p, v in zip(grp["period"], grp["sales"])}
+
+        hist_vals = grp["sales"].to_numpy(dtype=float)
+        sigma = float(np.std(hist_vals)) if len(hist_vals) >= 2 else max(1.0, float(np.mean(hist_vals)) * 0.2 if len(hist_vals) else 1.0)
+
+        for idx, month in enumerate(month_range):
+            if month in month_sales:
+                val = month_sales[month]
+            elif (month - 12) in month_sales:
+                val = month_sales[month - 12]
+            elif len(hist_vals) >= 3:
+                val = float(np.mean(hist_vals[-3:]))
+            elif len(hist_vals) >= 1:
+                val = float(hist_vals[-1])
+            else:
+                val = 0.0
+
+            month_sales[month] = max(0.0, float(val))
+            step = idx + 1
+            band = 1.28 * sigma * np.sqrt(max(1, step))
+            rows.append(
+                {
+                    "product_code": str(code),
+                    "month": str(month),
+                    "sales": round(month_sales[month], 2),
+                    "lower_bound": round(max(0.0, month_sales[month] - band), 2),
+                    "upper_bound": round(month_sales[month] + band, 2),
+                }
+            )
+
+    rows.sort(key=lambda r: (r["product_code"], r["month"]))
+    return rows
+
+
 def _evaluate_baseline_wmape(daily: pd.DataFrame) -> Optional[float]:
     if daily.empty:
         return None
@@ -459,11 +528,70 @@ def forecast_next_months(
     forecast_months = 3 if forecast_months <= 0 else forecast_months
     start_month_period = _parse_start_month(start_month)
 
-    daily, mapping, numeric_cols, cat_cols = _prepare_daily(
+    daily, mapping, numeric_cols, cat_cols, granularity = _prepare_daily(
         raw_rows,
         column_mapping=column_mapping,
         lifecycle_map=lifecycle_map,
     )
+
+    if granularity == "monthly":
+        rows = _predict_baseline_monthly(
+            history=daily[["product_code", "date", "sales"]],
+            start_month=start_month_period,
+            forecast_months=forecast_months,
+        )
+
+        if lifecycle_map:
+            adjusted_rows: List[Dict] = []
+            for row in rows:
+                code = str(row.get("product_code"))
+                month = pd.Period(str(row.get("month")), freq="M")
+                lifecycle = lifecycle_map.get(code, {})
+                start_raw = lifecycle.get("listing_date") if lifecycle else None
+                end_raw = lifecycle.get("delisting_date") if lifecycle else None
+                start = pd.to_datetime(start_raw, errors="coerce") if start_raw else None
+                end = pd.to_datetime(end_raw, errors="coerce") if end_raw else None
+
+                month_start = month.to_timestamp(how="start")
+                month_end = month.to_timestamp(how="end").normalize()
+
+                active = True
+                if start is not None and pd.notna(start) and month_end < start:
+                    active = False
+                if end is not None and pd.notna(end) and month_start > end:
+                    active = False
+
+                if not active:
+                    adjusted = dict(row)
+                    adjusted["sales"] = 0.0
+                    adjusted["lower_bound"] = 0.0
+                    adjusted["upper_bound"] = 0.0
+                    adjusted_rows.append(adjusted)
+                else:
+                    adjusted_rows.append(row)
+            rows = adjusted_rows
+
+        return MonthlyForecastOutput(
+            mapping=mapping,
+            metrics={
+                "selected_method": "monthly_baseline",
+                "selected_wmape": None,
+                "window": {
+                    "from_month": str(start_month_period),
+                    "to_month": str(start_month_period + (forecast_months - 1)),
+                },
+                "input_granularity": granularity,
+                "feature_selection": {
+                    "numeric_candidates": numeric_cols,
+                    "numeric_selected_by_correlation": [],
+                    "categorical_candidates": cat_cols,
+                    "holiday_feature_enabled": False,
+                },
+                "candidates": [{"method": "monthly_baseline", "wmape": None}],
+            },
+            rows=rows,
+        )
+
     daily = _add_calendar_features(daily)
     daily, encoded_cat_cols, _ = _encode_categories(daily, cat_cols)
     related_numeric = _select_related_features(daily, numeric_cols)
@@ -556,6 +684,7 @@ def forecast_next_months(
                 "categorical_candidates": cat_cols,
                 "holiday_feature_enabled": holidays is not None,
             },
+            "input_granularity": granularity,
             "candidates": [base_eval, lgb_eval],
         },
         rows=rows,
