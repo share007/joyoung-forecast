@@ -157,6 +157,29 @@ def init_db():
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS actual_sales_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT,
+            row_count INTEGER DEFAULT 0,
+            columns_json TEXT,
+            detected_columns_json TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS actual_sales_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actual_file_id INTEGER NOT NULL,
+            row_index INTEGER NOT NULL,
+            product_code TEXT NOT NULL,
+            month TEXT NOT NULL,
+            sales REAL NOT NULL,
+            FOREIGN KEY (actual_file_id) REFERENCES actual_sales_files(id)
+        )
+    ''')
     
     conn.commit()
     conn.close()
@@ -766,6 +789,84 @@ def delete_material_lifecycle_by_ids(ids: List[int]) -> int:
     conn.commit()
     conn.close()
     return int(deleted)
+
+
+def save_latest_actual_sales_file(
+    file_name: str,
+    rows: List[Dict],
+    columns: List[str],
+    detected_columns: Optional[Dict] = None,
+) -> int:
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Keep only the latest actual sales import snapshot.
+    cursor.execute('DELETE FROM actual_sales_rows')
+    cursor.execute('DELETE FROM actual_sales_files')
+
+    cursor.execute(
+        '''
+        INSERT INTO actual_sales_files (file_name, row_count, columns_json, detected_columns_json)
+        VALUES (?, ?, ?, ?)
+        ''',
+        (
+            file_name,
+            len(rows),
+            json.dumps(columns or [], ensure_ascii=False),
+            json.dumps(detected_columns or {}, ensure_ascii=False),
+        ),
+    )
+    actual_file_id = cursor.lastrowid
+
+    payload = [
+        (
+            actual_file_id,
+            idx,
+            str(row.get('product_code', '')),
+            str(row.get('month', '')),
+            float(row.get('sales', 0) or 0),
+        )
+        for idx, row in enumerate(rows)
+    ]
+    cursor.executemany(
+        '''
+        INSERT INTO actual_sales_rows (actual_file_id, row_index, product_code, month, sales)
+        VALUES (?, ?, ?, ?, ?)
+        ''',
+        payload,
+    )
+
+    conn.commit()
+    conn.close()
+    return actual_file_id
+
+
+def get_latest_actual_sales_file() -> Optional[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM actual_sales_files ORDER BY id DESC LIMIT 1')
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    item = dict(row)
+    file_id = item['id']
+    item['columns'] = _safe_json_loads(item.get('columns_json')) or []
+    item['detected_columns'] = _safe_json_loads(item.get('detected_columns_json')) or {}
+
+    cursor.execute(
+        '''
+        SELECT product_code, month, sales
+        FROM actual_sales_rows
+        WHERE actual_file_id = ?
+        ORDER BY product_code ASC, month ASC
+        ''',
+        (file_id,),
+    )
+    item['rows'] = [dict(x) for x in cursor.fetchall()]
+    conn.close()
+    return item
 
 
 def get_material_lifecycle_map() -> Dict[str, Dict[str, Optional[str]]]:

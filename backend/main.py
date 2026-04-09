@@ -6,7 +6,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 import json
 import ast
@@ -28,6 +28,7 @@ from database import (
     clear_monthly_forecast_runs, upsert_material_lifecycle,
     list_material_lifecycle, get_material_lifecycle_map,
     delete_material_lifecycle_by_ids,
+    save_latest_actual_sales_file, get_latest_actual_sales_file,
 )
 from services.forecasting import forecast_with_champion_challenger
 from services.importer import parse_upload_file, infer_column_mapping, normalize_raw_df, rows_to_json_ready
@@ -816,6 +817,202 @@ def delete_materials(request: MaterialDeleteRequest):
         'success': True,
         'deleted_count': deleted,
     }
+
+
+@app.post('/actuals/upload')
+async def upload_actual_sales(file: UploadFile = File(...)):
+    filename = file.filename or 'actual_sales_file'
+    ext = filename.lower()
+
+    try:
+        if ext.endswith('.csv'):
+            file.file.seek(0)
+            df = pd.read_csv(file.file)
+        elif ext.endswith(('.xlsx', '.xls')):
+            content = await file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail='文件内容为空')
+            df = pd.read_excel(BytesIO(content))
+        else:
+            raise HTTPException(status_code=400, detail='仅支持 CSV/XLS/XLSX')
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f'读取文件失败: {exc}')
+
+    if df is None or df.empty:
+        raise HTTPException(status_code=400, detail='文件没有可导入数据')
+
+    normalized = normalize_raw_df(df)
+    detected = infer_column_mapping(normalized)
+    product_col = detected.get('product_code')
+    date_col = detected.get('date')
+    sales_col = detected.get('sales')
+
+    if not product_col or product_col not in normalized.columns:
+        raise HTTPException(status_code=400, detail='未识别到产品编码列')
+    if not date_col or date_col not in normalized.columns:
+        raise HTTPException(status_code=400, detail='未识别到日期/月份列')
+    if not sales_col or sales_col not in normalized.columns:
+        raise HTTPException(status_code=400, detail='未识别到销量列')
+
+    work = pd.DataFrame(
+        {
+            'product_code': normalized[product_col].astype(str).str.strip(),
+            'date': pd.to_datetime(normalized[date_col], errors='coerce'),
+            'sales': pd.to_numeric(normalized[sales_col], errors='coerce'),
+        }
+    )
+    work = work.dropna(subset=['product_code', 'date', 'sales'])
+    work = work[work['product_code'] != '']
+
+    if work.empty:
+        raise HTTPException(status_code=400, detail='没有可用于偏差计算的有效记录')
+
+    work['month'] = work['date'].dt.to_period('M').astype(str)
+    monthly = (
+        work.groupby(['product_code', 'month'], as_index=False)['sales']
+        .sum()
+        .sort_values(['product_code', 'month'])
+    )
+
+    rows = [
+        {
+            'product_code': str(item['product_code']),
+            'month': str(item['month']),
+            'sales': float(item['sales']),
+        }
+        for _, item in monthly.iterrows()
+    ]
+
+    actual_file_id = save_latest_actual_sales_file(
+        file_name=filename,
+        rows=rows,
+        columns=normalized.columns.tolist(),
+        detected_columns=detected,
+    )
+
+    months = sorted({row['month'] for row in rows})
+    return _json_safe(
+        {
+            'success': True,
+            'actual_file_id': actual_file_id,
+            'file_name': filename,
+            'row_count': len(rows),
+            'months': months,
+            'detected_columns': detected,
+        }
+    )
+
+
+@app.get('/actuals/latest')
+def get_latest_actuals():
+    latest = get_latest_actual_sales_file()
+    if not latest:
+        return {
+            'success': True,
+            'exists': False,
+            'file': None,
+        }
+
+    return _json_safe(
+        {
+            'success': True,
+            'exists': True,
+            'file': {
+                'id': latest.get('id'),
+                'file_name': latest.get('file_name'),
+                'row_count': latest.get('row_count', 0),
+                'columns': latest.get('columns', []),
+                'detected_columns': latest.get('detected_columns', {}),
+                'created_at': latest.get('created_at'),
+                'months': sorted({str(item.get('month')) for item in (latest.get('rows') or []) if item.get('month')}),
+            },
+        }
+    )
+
+
+@app.post('/forecast/monthly/deviation/calculate')
+def calculate_monthly_deviation():
+    runs = get_monthly_forecast_runs(limit=1)
+    if not runs:
+        raise HTTPException(status_code=404, detail='暂无预测结果，请先运行月度预测')
+
+    latest_actual = get_latest_actual_sales_file()
+    if not latest_actual:
+        raise HTTPException(status_code=404, detail='暂无真实销量数据，请先导入真实销售文件')
+
+    forecast_run = runs[0]
+    forecast_rows = forecast_run.get('rows', []) or []
+    actual_rows = latest_actual.get('rows', []) or []
+
+    forecast_monthly: Dict[str, float] = {}
+    for row in forecast_rows:
+        month = str(row.get('month', ''))
+        forecast_monthly[month] = forecast_monthly.get(month, 0.0) + float(row.get('sales', 0) or 0)
+
+    actual_monthly: Dict[str, float] = {}
+    for row in actual_rows:
+        month = str(row.get('month', ''))
+        actual_monthly[month] = actual_monthly.get(month, 0.0) + float(row.get('sales', 0) or 0)
+
+    months = sorted(set(forecast_monthly.keys()) | set(actual_monthly.keys()))
+    month_rows = []
+    for month in months:
+        forecast_val = float(forecast_monthly.get(month, 0.0))
+        actual_val = float(actual_monthly.get(month, 0.0))
+        diff = forecast_val - actual_val
+        diff_rate = (diff / actual_val) if actual_val != 0 else None
+        month_rows.append(
+            {
+                'month': month,
+                'actual_sales': round(actual_val, 2),
+                'forecast_sales': round(forecast_val, 2),
+                'difference': round(diff, 2),
+                'difference_rate': round(diff_rate, 6) if diff_rate is not None else None,
+            }
+        )
+
+    # Detailed product-month deviation rows (for debugging/traceability)
+    actual_map = {
+        (str(item.get('product_code')), str(item.get('month'))): float(item.get('sales', 0) or 0)
+        for item in actual_rows
+    }
+    detail_rows = []
+    for row in forecast_rows:
+        key = (str(row.get('product_code')), str(row.get('month')))
+        f = float(row.get('sales', 0) or 0)
+        a = float(actual_map.get(key, 0.0))
+        d = f - a
+        r = (d / a) if a != 0 else None
+        detail_rows.append(
+            {
+                'product_code': key[0],
+                'month': key[1],
+                'actual_sales': round(a, 2),
+                'forecast_sales': round(f, 2),
+                'difference': round(d, 2),
+                'difference_rate': round(r, 6) if r is not None else None,
+            }
+        )
+
+    return _json_safe(
+        {
+            'success': True,
+            'forecast_run': {
+                'id': forecast_run.get('id'),
+                'run_date': forecast_run.get('run_date'),
+                'created_at': forecast_run.get('created_at'),
+            },
+            'actual_file': {
+                'id': latest_actual.get('id'),
+                'file_name': latest_actual.get('file_name'),
+                'created_at': latest_actual.get('created_at'),
+            },
+            'months': month_rows,
+            'details': detail_rows,
+        }
+    )
 
 
 if __name__ == "__main__":

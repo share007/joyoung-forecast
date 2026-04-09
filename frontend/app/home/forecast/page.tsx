@@ -41,6 +41,19 @@ export default function ForecastHomePage() {
           >
             商品基础数据导入
           </Link>
+          <Link
+            href="/home/forecast/deviation"
+            style={{
+              display: 'inline-block',
+              padding: '10px 16px',
+              borderRadius: 10,
+              border: '1px solid var(--jy-border, #efd8b0)',
+              color: 'var(--jy-muted, #7f6a4a)',
+              fontWeight: 700,
+            }}
+          >
+            预测偏差核对
+          </Link>
         </section>
       </section>
     </main>
