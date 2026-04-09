@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, ChangeEvent } from 'react'
 import Link from 'next/link'
-import { AlertCircle, ArrowLeft, Download, Loader2, Trash2, Upload } from 'lucide-react'
+import { AlertCircle, Download, Loader2, Trash2, Upload } from 'lucide-react'
+import ForecastTabs from '../components/ForecastTabs'
 
 interface MonthlyForecastRow {
   product_code: string
@@ -396,14 +397,7 @@ export default function DashboardPage() {
   return (
     <main style={{ minHeight: '100vh', padding: 20 }}>
       <section className="card" style={{ maxWidth: 1200, margin: '0 auto', borderRadius: 16, padding: 20 }}>
-        <Link href="/home/forecast" style={{ color: 'var(--jy-muted, #7f6a4a)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <ArrowLeft size={16} /> 返回
-        </Link>
-        <div style={{ marginTop: 8 }}>
-          <Link href="/home/forecast/materials" style={{ color: 'var(--jy-muted, #7f6a4a)', fontSize: 13 }}>
-            前往商品基础数据导入
-          </Link>
-        </div>
+        <ForecastTabs />
         <h1 style={{ marginBottom: 8 }}>九阳月度销量预测</h1>
         <p style={{ marginTop: 0, color: 'var(--jy-muted, #7f6a4a)' }}>上传历史日销量数据，系统将输出当前月起未来3个月各产品编码销量。</p>
 

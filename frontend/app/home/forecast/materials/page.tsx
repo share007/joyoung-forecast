@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, ChangeEvent } from 'react'
-import Link from 'next/link'
-import { ArrowLeft, Loader2, Upload } from 'lucide-react'
+import { Loader2, Upload } from 'lucide-react'
+import ForecastTabs from '../components/ForecastTabs'
 
 interface MaterialItem {
   id: number
@@ -127,9 +127,7 @@ export default function MaterialsPage() {
   return (
     <main style={{ minHeight: '100vh', padding: 20 }}>
       <section className="card" style={{ maxWidth: 1100, margin: '0 auto', borderRadius: 16, padding: 20 }}>
-        <Link href="/home/forecast" style={{ color: 'var(--jy-muted, #7f6a4a)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <ArrowLeft size={16} /> 返回
-        </Link>
+        <ForecastTabs />
 
         <h1 style={{ marginBottom: 8 }}>商品基础数据管理</h1>
         <p style={{ marginTop: 0, color: 'var(--jy-muted, #7f6a4a)' }}>

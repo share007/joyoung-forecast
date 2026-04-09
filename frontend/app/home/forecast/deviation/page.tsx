@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, ChangeEvent } from 'react'
-import Link from 'next/link'
-import { ArrowLeft, Calculator, Loader2, Upload } from 'lucide-react'
+import { Calculator, Download, Loader2, Upload } from 'lucide-react'
+import * as XLSX from 'xlsx'
+import ForecastTabs from '../components/ForecastTabs'
 
 interface DeviationMonthRow {
   month: string
@@ -53,6 +54,14 @@ export default function DeviationPage() {
   const [monthRows, setMonthRows] = useState<DeviationMonthRow[]>([])
   const [detailRows, setDetailRows] = useState<DeviationDetailRow[]>([])
   const [forecastRunText, setForecastRunText] = useState('')
+  const [monthSort, setMonthSort] = useState<{ key: keyof DeviationMonthRow; direction: 'asc' | 'desc' }>({
+    key: 'month',
+    direction: 'asc',
+  })
+  const [detailSort, setDetailSort] = useState<{ key: keyof DeviationDetailRow; direction: 'asc' | 'desc' }>({
+    key: 'product_code',
+    direction: 'asc',
+  })
 
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -134,12 +143,82 @@ export default function DeviationPage() {
     }
   }
 
+  const sortMonthBy = (key: keyof DeviationMonthRow) => {
+    setMonthSort((prev) => ({
+      key,
+      direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc',
+    }))
+  }
+
+  const sortDetailBy = (key: keyof DeviationDetailRow) => {
+    setDetailSort((prev) => ({
+      key,
+      direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc',
+    }))
+  }
+
+  const sortedMonthRows = [...monthRows].sort((a, b) => {
+    const av = a[monthSort.key]
+    const bv = b[monthSort.key]
+    const dir = monthSort.direction === 'asc' ? 1 : -1
+
+    if (monthSort.key === 'month') {
+      return String(av).localeCompare(String(bv)) * dir
+    }
+    const an = av === null ? Number.NEGATIVE_INFINITY : Number(av)
+    const bn = bv === null ? Number.NEGATIVE_INFINITY : Number(bv)
+    return (an - bn) * dir
+  })
+
+  const sortedDetailRows = [...detailRows].sort((a, b) => {
+    const av = a[detailSort.key]
+    const bv = b[detailSort.key]
+    const dir = detailSort.direction === 'asc' ? 1 : -1
+
+    if (detailSort.key === 'product_code' || detailSort.key === 'month') {
+      return String(av).localeCompare(String(bv)) * dir
+    }
+    const an = av === null ? Number.NEGATIVE_INFINITY : Number(av)
+    const bn = bv === null ? Number.NEGATIVE_INFINITY : Number(bv)
+    return (an - bn) * dir
+  })
+
+  const exportDeviationExcel = () => {
+    if (!sortedMonthRows.length && !sortedDetailRows.length) return
+
+    const wb = XLSX.utils.book_new()
+    const monthSheetRows = sortedMonthRows.map((row) => ({
+      月份: row.month,
+      真实销量: row.actual_sales,
+      预测销量: row.forecast_sales,
+      差异量_预测减真实: row.difference,
+      差异率: row.difference_rate === null ? '' : `${(row.difference_rate * 100).toFixed(2)}%`,
+    }))
+    const detailSheetRows = sortedDetailRows.map((row) => ({
+      产品编码: row.product_code,
+      月份: row.month,
+      真实销量: row.actual_sales,
+      预测销量: row.forecast_sales,
+      差异量_预测减真实: row.difference,
+      差异率: row.difference_rate === null ? '' : `${(row.difference_rate * 100).toFixed(2)}%`,
+    }))
+
+    const wsMonth = XLSX.utils.json_to_sheet(monthSheetRows)
+    const wsDetail = XLSX.utils.json_to_sheet(detailSheetRows)
+    XLSX.utils.book_append_sheet(wb, wsMonth, '月度偏差结果')
+    XLSX.utils.book_append_sheet(wb, wsDetail, '产品明细偏差')
+
+    const now = new Date()
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(
+      now.getHours(),
+    ).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
+    XLSX.writeFile(wb, `forecast_deviation_${stamp}.xlsx`)
+  }
+
   return (
     <main style={{ minHeight: '100vh', padding: 20 }}>
       <section className="card" style={{ maxWidth: 1200, margin: '0 auto', borderRadius: 16, padding: 20 }}>
-        <Link href="/home/forecast" style={{ color: 'var(--jy-muted, #7f6a4a)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <ArrowLeft size={16} /> 返回
-        </Link>
+        <ForecastTabs />
 
         <h1 style={{ marginBottom: 8 }}>预测偏差核对</h1>
         <p style={{ marginTop: 0, color: 'var(--jy-muted, #7f6a4a)' }}>
@@ -203,19 +282,29 @@ export default function DeviationPage() {
         <section className="card" style={{ marginTop: 14, borderRadius: 12, padding: 12 }}>
           <h3 style={{ marginTop: 0 }}>月度偏差结果</h3>
           {forecastRunText && <p style={{ marginTop: 0, color: 'var(--jy-muted, #7f6a4a)' }}>{forecastRunText}</p>}
+          <div style={{ marginBottom: 10 }}>
+            <button
+              style={ghostButton}
+              disabled={loading || (!sortedMonthRows.length && !sortedDetailRows.length)}
+              onClick={exportDeviationExcel}
+              title={sortedMonthRows.length || sortedDetailRows.length ? '导出月度偏差和产品明细偏差到同一个Excel文件' : '暂无可导出数据'}
+            >
+              <Download size={16} /> 导出偏差结果
+            </button>
+          </div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ background: 'var(--jy-surface-soft, #fff6ea)' }}>
-                  <th style={thStyle}>月份</th>
-                  <th style={thStyle}>真实销量</th>
-                  <th style={thStyle}>预测销量</th>
-                  <th style={thStyle}>差异量(预测-真实)</th>
-                  <th style={thStyle}>差异率</th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortMonthBy('month')}>月份 {monthSort.key === 'month' ? (monthSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortMonthBy('actual_sales')}>真实销量 {monthSort.key === 'actual_sales' ? (monthSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortMonthBy('forecast_sales')}>预测销量 {monthSort.key === 'forecast_sales' ? (monthSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortMonthBy('difference')}>差异量(预测-真实) {monthSort.key === 'difference' ? (monthSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortMonthBy('difference_rate')}>差异率 {monthSort.key === 'difference_rate' ? (monthSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
                 </tr>
               </thead>
               <tbody>
-                {monthRows.map((row) => (
+                {sortedMonthRows.map((row) => (
                   <tr key={row.month} style={{ borderTop: '1px solid var(--jy-border, #efd8b0)' }}>
                     <td style={tdStyle}>{row.month}</td>
                     <td style={tdStyle}>{row.actual_sales}</td>
@@ -224,7 +313,7 @@ export default function DeviationPage() {
                     <td style={tdStyle}>{formatRate(row.difference_rate)}</td>
                   </tr>
                 ))}
-                {!monthRows.length && (
+                {!sortedMonthRows.length && (
                   <tr>
                     <td style={tdStyle} colSpan={5}>暂无偏差结果</td>
                   </tr>
@@ -240,16 +329,16 @@ export default function DeviationPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead>
                 <tr style={{ background: 'var(--jy-surface-soft, #fff6ea)' }}>
-                  <th style={thStyle}>产品编码</th>
-                  <th style={thStyle}>月份</th>
-                  <th style={thStyle}>真实销量</th>
-                  <th style={thStyle}>预测销量</th>
-                  <th style={thStyle}>差异量</th>
-                  <th style={thStyle}>差异率</th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortDetailBy('product_code')}>产品编码 {detailSort.key === 'product_code' ? (detailSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortDetailBy('month')}>月份 {detailSort.key === 'month' ? (detailSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortDetailBy('actual_sales')}>真实销量 {detailSort.key === 'actual_sales' ? (detailSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortDetailBy('forecast_sales')}>预测销量 {detailSort.key === 'forecast_sales' ? (detailSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortDetailBy('difference')}>差异量 {detailSort.key === 'difference' ? (detailSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
+                  <th style={thStyle}><button style={sortButton} onClick={() => sortDetailBy('difference_rate')}>差异率 {detailSort.key === 'difference_rate' ? (detailSort.direction === 'asc' ? '↑' : '↓') : '↕'}</button></th>
                 </tr>
               </thead>
               <tbody>
-                {detailRows.map((row, idx) => (
+                {sortedDetailRows.map((row, idx) => (
                   <tr key={`${row.product_code}-${row.month}-${idx}`} style={{ borderTop: '1px solid var(--jy-border, #efd8b0)' }}>
                     <td style={tdStyle}>{row.product_code}</td>
                     <td style={tdStyle}>{row.month}</td>
@@ -259,7 +348,7 @@ export default function DeviationPage() {
                     <td style={tdStyle}>{formatRate(row.difference_rate)}</td>
                   </tr>
                 ))}
-                {!detailRows.length && (
+                {!sortedDetailRows.length && (
                   <tr>
                     <td style={tdStyle} colSpan={6}>暂无明细偏差</td>
                   </tr>
@@ -316,6 +405,16 @@ const thStyle: CSSProperties = {
   textAlign: 'left',
   padding: '10px 12px',
   color: 'var(--jy-muted, #7f6a4a)',
+}
+
+const sortButton: CSSProperties = {
+  border: 'none',
+  background: 'transparent',
+  padding: 0,
+  margin: 0,
+  color: 'inherit',
+  fontWeight: 700,
+  cursor: 'pointer',
 }
 
 const tdStyle: CSSProperties = {
