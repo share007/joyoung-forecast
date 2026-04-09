@@ -31,6 +31,16 @@ def _wmape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.abs(y_true - y_pred).sum() / denom)
 
 
+def _parse_start_month(start_month: Optional[str]) -> pd.Period:
+    if start_month:
+        normalized = str(start_month).strip().replace('/', '-')
+        try:
+            return pd.Period(normalized, freq="M")
+        except Exception as exc:
+            raise ValueError("start_month 格式应为 YYYY-MM，例如 2026-01") from exc
+    return pd.Timestamp.today().to_period("M")
+
+
 def _prepare_daily(
     raw_rows: List[Dict],
     column_mapping: Optional[Dict[str, str]] = None,
@@ -281,13 +291,20 @@ def _future_template(history: pd.DataFrame, start: pd.Timestamp, end: pd.Timesta
     return pd.DataFrame(rows)
 
 
-def _predict_lgbm_daily(history: pd.DataFrame, model, feature_cols: List[str], num_cols: List[str], cat_cols: List[str]) -> pd.DataFrame:
+def _predict_lgbm_daily(
+    history: pd.DataFrame,
+    model,
+    feature_cols: List[str],
+    num_cols: List[str],
+    cat_cols: List[str],
+    start_month: pd.Period,
+    forecast_months: int,
+) -> pd.DataFrame:
     if history.empty:
         return pd.DataFrame(columns=["product_code", "date", "sales"])
 
-    now_month = pd.Timestamp.today().to_period("M")
-    start = max(now_month.to_timestamp(), history["date"].max() + pd.Timedelta(days=1))
-    end = (now_month + 2).to_timestamp(how="end").normalize()
+    start = max(start_month.to_timestamp(), history["date"].max() + pd.Timedelta(days=1))
+    end = (start_month + (forecast_months - 1)).to_timestamp(how="end").normalize()
     if start > end:
         return pd.DataFrame(columns=["product_code", "date", "sales"])
 
@@ -310,16 +327,15 @@ def _predict_lgbm_daily(history: pd.DataFrame, model, feature_cols: List[str], n
     return full[full["date"] >= start][["product_code", "date", "sales"]]
 
 
-def _predict_baseline_daily(history: pd.DataFrame) -> pd.DataFrame:
-    now_month = pd.Timestamp.today().to_period("M")
-    start_month = now_month.to_timestamp()
-    end = (now_month + 2).to_timestamp(how="end").normalize()
+def _predict_baseline_daily(history: pd.DataFrame, start_month: pd.Period, forecast_months: int) -> pd.DataFrame:
+    start_month_ts = start_month.to_timestamp()
+    end = (start_month + (forecast_months - 1)).to_timestamp(how="end").normalize()
 
     out: List[Dict] = []
     for code, grp in history.groupby("product_code"):
         grp = grp.sort_values("date")
         values = grp["sales"].to_numpy(dtype=float)
-        start = max(start_month, grp["date"].max() + pd.Timedelta(days=1))
+        start = max(start_month_ts, grp["date"].max() + pd.Timedelta(days=1))
         horizon = (end - start).days + 1
         if horizon <= 0:
             continue
@@ -395,7 +411,7 @@ def _evaluate_baseline_wmape(daily: pd.DataFrame) -> Optional[float]:
     return _wmape(y_true, y_pred)
 
 
-def _aggregate_monthly(history: pd.DataFrame, future_daily: pd.DataFrame) -> List[Dict]:
+def _aggregate_monthly(history: pd.DataFrame, future_daily: pd.DataFrame, start_month: pd.Period, forecast_months: int) -> List[Dict]:
     history = history.copy()
     future_daily = future_daily.copy()
     history["date"] = pd.to_datetime(history["date"], errors="coerce")
@@ -403,8 +419,7 @@ def _aggregate_monthly(history: pd.DataFrame, future_daily: pd.DataFrame) -> Lis
     history = history.dropna(subset=["date"])
     future_daily = future_daily.dropna(subset=["date"])
 
-    now_month = pd.Timestamp.today().to_period("M")
-    month_range = pd.period_range(now_month, now_month + 2, freq="M")
+    month_range = pd.period_range(start_month, start_month + (forecast_months - 1), freq="M")
 
     hist_window = history[history["date"].dt.to_period("M").isin(month_range)]
     combined = pd.concat([hist_window, future_daily], ignore_index=True)
@@ -417,7 +432,7 @@ def _aggregate_monthly(history: pd.DataFrame, future_daily: pd.DataFrame) -> Lis
         sigma = float(hist_code["sales"].std()) if len(hist_code) >= 2 else max(1.0, float(hist_code["sales"].mean()) * 0.2 if len(hist_code) else 1.0)
         for month in month_range:
             val = float(grp.loc[grp["month"] == month, "sales"].sum())
-            step = month.ordinal - now_month.ordinal + 1
+            step = month.ordinal - start_month.ordinal + 1
             band = 1.28 * sigma * np.sqrt(max(1, step))
             rows.append(
                 {
@@ -438,9 +453,11 @@ def forecast_next_months(
     forecast_months: int = 3,
     column_mapping: Optional[Dict[str, str]] = None,
     lifecycle_map: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+    start_month: Optional[str] = None,
 ) -> MonthlyForecastOutput:
-    # Business requirement fixed at 3 months: current month + next two months.
-    forecast_months = 3
+    # Business requirement fixed at 3 months by default.
+    forecast_months = 3 if forecast_months <= 0 else forecast_months
+    start_month_period = _parse_start_month(start_month)
 
     daily, mapping, numeric_cols, cat_cols = _prepare_daily(
         raw_rows,
@@ -460,12 +477,18 @@ def forecast_next_months(
             feature_cols=feature_cols,
             num_cols=related_numeric,
             cat_cols=cat_cols,
+            start_month=start_month_period,
+            forecast_months=forecast_months,
         )
     else:
         pred_lgb = pd.DataFrame(columns=["product_code", "date", "sales"])
         lgb_metric = {"method": "global_lightgbm_daily", "wmape": 999.0, "status": "not_available"}
 
-    pred_base = _predict_baseline_daily(daily[["product_code", "date", "sales"]])
+    pred_base = _predict_baseline_daily(
+        daily[["product_code", "date", "sales"]],
+        start_month=start_month_period,
+        forecast_months=forecast_months,
+    )
 
     lgb_eval = lgb_metric
     baseline_wmape = _evaluate_baseline_wmape(daily[["product_code", "date", "sales"]])
@@ -481,7 +504,12 @@ def forecast_next_months(
     selected_method = "global_lightgbm_daily" if use_lgb else "intermittent_baseline"
     selected_daily = pred_lgb if use_lgb else pred_base
 
-    rows = _aggregate_monthly(daily[["product_code", "date", "sales"]], selected_daily)
+    rows = _aggregate_monthly(
+        daily[["product_code", "date", "sales"]],
+        selected_daily,
+        start_month=start_month_period,
+        forecast_months=forecast_months,
+    )
 
     if lifecycle_map:
         adjusted_rows: List[Dict] = []
@@ -513,13 +541,15 @@ def forecast_next_months(
                 adjusted_rows.append(row)
         rows = adjusted_rows
 
-    now_month = pd.Timestamp.today().to_period("M")
     return MonthlyForecastOutput(
         mapping=mapping,
         metrics={
             "selected_method": selected_method,
             "selected_wmape": lgb_eval.get("wmape") if use_lgb else base_eval.get("wmape"),
-            "window": {"from_month": str(now_month), "to_month": str(now_month + 2)},
+            "window": {
+                "from_month": str(start_month_period),
+                "to_month": str(start_month_period + (forecast_months - 1)),
+            },
             "feature_selection": {
                 "numeric_candidates": numeric_cols,
                 "numeric_selected_by_correlation": related_numeric,

@@ -52,6 +52,7 @@ export default function DashboardPage() {
   const [importColumns, setImportColumns] = useState<string[]>([])
   const [detected, setDetected] = useState<Record<string, string>>({})
   const [columnMapping, setColumnMapping] = useState({ product_code: '', date: '', sales: '' })
+  const [startMonth, setStartMonth] = useState('2026-01')
   const [importFiles, setImportFiles] = useState<ImportFileRecord[]>([])
   const [forecastRuns, setForecastRuns] = useState<ForecastRun[]>([])
   const [algorithmSummary, setAlgorithmSummary] = useState('')
@@ -218,6 +219,7 @@ export default function DashboardPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           forecast_months: 3,
+          start_month: startMonth,
           column_mapping: mappingPayload,
         }),
       })
@@ -453,6 +455,13 @@ export default function DashboardPage() {
         )}
 
         <section style={{ marginTop: 14, display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+          <input
+            type="month"
+            value={startMonth}
+            onChange={(e) => setStartMonth(e.target.value)}
+            style={inputStyle}
+            title="预测起始月份（默认 2026-01）"
+          />
           <button
             style={primaryButton}
             onClick={() => fileInputRef.current?.click()}

@@ -79,6 +79,7 @@ class MonthlyForecastRequest(BaseModel):
     """按产品编码-月份预测请求（默认未来3个月）"""
     forecast_months: int = 3
     column_mapping: Optional[dict] = None
+    start_month: Optional[str] = None
 
 
 class MaterialLifecycleItem(BaseModel):
@@ -623,6 +624,7 @@ def forecast_monthly(request: MonthlyForecastRequest):
             forecast_months=request.forecast_months,
             column_mapping=request.column_mapping,
             lifecycle_map=lifecycle_map,
+            start_month=request.start_month,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -656,6 +658,7 @@ def forecast_monthly(request: MonthlyForecastRequest):
         'source_file_count': len(import_files),
         'source_row_count': len(rows),
         'forecast_months': request.forecast_months,
+        'start_month': request.start_month,
         'mapping': output.mapping,
         'algorithm': algorithm,
         'metrics': output.metrics,
