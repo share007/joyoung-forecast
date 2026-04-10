@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date as dt_date, timedelta
 import importlib
 import re
 from typing import Dict, List, Optional, Tuple
@@ -60,6 +60,60 @@ def _detect_time_granularity(raw_date_series: pd.Series) -> str:
     if day_one_ratio >= 0.95 and unique_months > 0 and unique_dates <= unique_months + 1:
         return "monthly"
     return "daily"
+
+
+def _in_618_window(d: dt_date) -> bool:
+    if d.month == 5 and d.day >= 20:
+        return True
+    if d.month == 6 and d.day <= 20:
+        return True
+    return False
+
+
+def _in_double11_window(d: dt_date) -> bool:
+    if d.month == 10 and d.day >= 20:
+        return True
+    if d.month == 11 and d.day <= 11:
+        return True
+    return False
+
+
+def _build_spring_festival_dates(years: List[int]) -> set[dt_date]:
+    if holidays is None:
+        return set()
+
+    cn = holidays.country_holidays("CN", years=years)
+    spring_dates: set[dt_date] = set()
+    for d, name in cn.items():
+        text = str(name)
+        if "春节" in text or "Chinese New Year" in text or "Spring Festival" in text or "Lunar New Year" in text:
+            spring_dates.add(d)
+    return spring_dates
+
+
+def _in_cny_window(d: dt_date, spring_dates: set[dt_date]) -> bool:
+    if not spring_dates:
+        # Fallback approximation if holiday lib is unavailable.
+        return (d.month == 1 and d.day >= 20) or (d.month == 2 and d.day <= 15)
+
+    for sf in spring_dates:
+        if abs((d - sf).days) <= 10:
+            return True
+    return False
+
+
+def _add_event_flags(data: pd.DataFrame) -> pd.DataFrame:
+    out = data.copy()
+    valid_dates = out["date"].dropna()
+    years = sorted({int(y) for y in valid_dates.dt.year.unique().tolist()})
+    if years:
+        years = [min(years) - 1] + years + [max(years) + 1]
+    spring_dates = _build_spring_festival_dates(years)
+
+    out["is_618"] = out["date"].dt.date.apply(lambda d: 1 if _in_618_window(d) else 0)
+    out["is_double11"] = out["date"].dt.date.apply(lambda d: 1 if _in_double11_window(d) else 0)
+    out["is_cny_window"] = out["date"].dt.date.apply(lambda d: 1 if _in_cny_window(d, spring_dates) else 0)
+    return out
 
 
 def _prepare_daily(
@@ -175,6 +229,7 @@ def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
         data["is_holiday"] = data["date"].dt.date.apply(lambda d: 1 if d in cn else 0)
     else:
         data["is_holiday"] = data["is_weekend"]
+    data = _add_event_flags(data)
     return data
 
 
@@ -241,6 +296,39 @@ def _intermittent_daily(values: np.ndarray, horizon: int) -> np.ndarray:
     return np.array([daily] * horizon)
 
 
+def _safe_ratio(numerator: float, denominator: float, default: float = 1.0, low: float = 0.6, high: float = 1.8) -> float:
+    if denominator <= 0:
+        return default
+    value = numerator / denominator
+    return float(np.clip(value, low, high))
+
+
+def _estimate_daily_event_factors(history: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    # history columns: product_code, date, sales
+    event_df = _add_event_flags(history[["product_code", "date", "sales"]])
+    factors: Dict[str, Dict[str, float]] = {}
+
+    for code, grp in event_df.groupby("product_code"):
+        grp = grp.sort_values("date")
+
+        base_56 = grp["sales"].tail(56)
+        base = float(base_56.mean()) if len(base_56) else float(grp["sales"].mean()) if len(grp) else 0.0
+        if base <= 0:
+            base = 1.0
+
+        f_618 = _safe_ratio(float(grp.loc[grp["is_618"] == 1, "sales"].mean() or base), base, default=1.05, low=0.8, high=2.2)
+        f_11 = _safe_ratio(float(grp.loc[grp["is_double11"] == 1, "sales"].mean() or base), base, default=1.08, low=0.8, high=2.5)
+        f_cny = _safe_ratio(float(grp.loc[grp["is_cny_window"] == 1, "sales"].mean() or base), base, default=0.9, low=0.4, high=1.1)
+
+        factors[str(code)] = {
+            "promo_618": f_618,
+            "promo_double11": f_11,
+            "cny": f_cny,
+        }
+
+    return factors
+
+
 def _train_lgbm(df: pd.DataFrame, related_numeric: List[str], encoded_cat: List[str]):
     try:
         import lightgbm as lgb
@@ -250,6 +338,7 @@ def _train_lgbm(df: pd.DataFrame, related_numeric: List[str], encoded_cat: List[
     feat = _build_lag_features(df)
     feature_cols = [
         "product_idx", "dayofweek", "day", "month", "quarter", "is_weekend", "is_holiday",
+        "is_618", "is_double11", "is_cny_window",
         "lag_1", "lag_7", "lag_14", "lag_28", "rolling_mean_7", "rolling_mean_28", "rolling_std_28",
     ] + related_numeric + encoded_cat
 
@@ -358,8 +447,11 @@ def _predict_lgbm_daily(
 def _predict_baseline_daily(history: pd.DataFrame, start_month: pd.Period, forecast_months: int) -> pd.DataFrame:
     start_month_ts = start_month.to_timestamp()
     end = (start_month + (forecast_months - 1)).to_timestamp(how="end").normalize()
+    horizon_years = list(range(int(start_month.year) - 1, int((start_month + (forecast_months - 1)).year) + 2))
+    spring_dates = _build_spring_festival_dates(horizon_years)
 
     out: List[Dict] = []
+    event_factors = _estimate_daily_event_factors(history)
     for code, grp in history.groupby("product_code"):
         grp = grp.sort_values("date")
         values = grp["sales"].to_numpy(dtype=float)
@@ -385,7 +477,16 @@ def _predict_baseline_daily(history: pd.DataFrame, start_month: pd.Period, forec
                 preds = np.array([base] * horizon)
 
         for i, v in enumerate(preds):
-            out.append({"product_code": str(code), "date": start + pd.Timedelta(days=i), "sales": max(0.0, float(v))})
+            day = (start + pd.Timedelta(days=i)).date()
+            factor = 1.0
+            code_factors = event_factors.get(str(code), {})
+            if _in_618_window(day):
+                factor *= float(code_factors.get("promo_618", 1.05))
+            if _in_double11_window(day):
+                factor *= float(code_factors.get("promo_double11", 1.08))
+            if _in_cny_window(day, spring_dates):
+                factor *= float(code_factors.get("cny", 0.9))
+            out.append({"product_code": str(code), "date": start + pd.Timedelta(days=i), "sales": max(0.0, float(v) * factor)})
 
     return pd.DataFrame(out)
 
@@ -398,6 +499,13 @@ def _predict_baseline_monthly(history: pd.DataFrame, start_month: pd.Period, for
         grp = grp.sort_values("date").copy()
         grp["period"] = grp["date"].dt.to_period("M")
         month_sales = {p: float(v) for p, v in zip(grp["period"], grp["sales"])}
+
+        overall_avg = float(grp["sales"].mean()) if len(grp) else 0.0
+        month_index: Dict[int, float] = {}
+        if overall_avg > 0:
+            month_avg = grp.groupby(grp["date"].dt.month)["sales"].mean()
+            for m, avg in month_avg.items():
+                month_index[int(m)] = float(np.clip(avg / overall_avg, 0.6, 1.8))
 
         hist_vals = grp["sales"].to_numpy(dtype=float)
         sigma = float(np.std(hist_vals)) if len(hist_vals) >= 2 else max(1.0, float(np.mean(hist_vals)) * 0.2 if len(hist_vals) else 1.0)
@@ -413,6 +521,19 @@ def _predict_baseline_monthly(history: pd.DataFrame, start_month: pd.Period, for
                 val = float(hist_vals[-1])
             else:
                 val = 0.0
+
+            # Apply month-level event/seasonality adjustment for monthly-granularity data.
+            m = int(month.month)
+            seasonal_factor = month_index.get(m, 1.0)
+            val *= seasonal_factor
+
+            # Explicit business event windows mapped to affected months.
+            if m in (5, 6):
+                val *= max(1.02, float((month_index.get(5, 1.0) + month_index.get(6, 1.0)) / 2.0))
+            if m in (10, 11):
+                val *= max(1.02, float((month_index.get(10, 1.0) + month_index.get(11, 1.0)) / 2.0))
+            if m in (1, 2):
+                val *= min(0.98, float((month_index.get(1, 1.0) + month_index.get(2, 1.0)) / 2.0))
 
             month_sales[month] = max(0.0, float(val))
             step = idx + 1
@@ -585,7 +706,12 @@ def forecast_next_months(
                     "numeric_candidates": numeric_cols,
                     "numeric_selected_by_correlation": [],
                     "categorical_candidates": cat_cols,
-                    "holiday_feature_enabled": False,
+                    "holiday_feature_enabled": holidays is not None,
+                },
+                "event_adjustments": {
+                    "promo_618_window": "05-20 to 06-20",
+                    "promo_double11_window": "10-20 to 11-11",
+                    "cny_window": "dynamic lunar new year period",
                 },
                 "candidates": [{"method": "monthly_baseline", "wmape": None}],
             },
@@ -683,6 +809,11 @@ def forecast_next_months(
                 "numeric_selected_by_correlation": related_numeric,
                 "categorical_candidates": cat_cols,
                 "holiday_feature_enabled": holidays is not None,
+            },
+            "event_adjustments": {
+                "promo_618_window": "05-20 to 06-20",
+                "promo_double11_window": "10-20 to 11-11",
+                "cny_window": "dynamic lunar new year period",
             },
             "input_granularity": granularity,
             "candidates": [base_eval, lgb_eval],
