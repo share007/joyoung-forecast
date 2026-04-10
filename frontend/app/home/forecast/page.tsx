@@ -26,20 +26,7 @@ export default function ForecastHomePage() {
               fontWeight: 700,
             }}
           >
-            打开仪表盘
-          </Link>
-          <Link
-            href="/home/forecast/materials"
-            style={{
-              display: 'inline-block',
-              padding: '10px 16px',
-              borderRadius: 10,
-              border: '1px solid var(--jy-border, #efd8b0)',
-              color: 'var(--jy-muted, #7f6a4a)',
-              fontWeight: 700,
-            }}
-          >
-            商品基础数据导入
+            运行预测
           </Link>
           <Link
             href="/home/forecast/deviation"
@@ -53,6 +40,19 @@ export default function ForecastHomePage() {
             }}
           >
             预测偏差核对
+          </Link>
+          <Link
+            href="/home/forecast/materials"
+            style={{
+              display: 'inline-block',
+              padding: '10px 16px',
+              borderRadius: 10,
+              border: '1px solid var(--jy-border, #efd8b0)',
+              color: 'var(--jy-muted, #7f6a4a)',
+              fontWeight: 700,
+            }}
+          >
+            基础数据
           </Link>
         </section>
       </section>

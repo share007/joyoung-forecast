@@ -29,6 +29,7 @@ from database import (
     list_material_lifecycle, get_material_lifecycle_map,
     delete_material_lifecycle_by_ids,
     save_latest_actual_sales_file, get_latest_actual_sales_file,
+    clear_latest_actual_sales_file,
 )
 from services.forecasting import forecast_with_champion_challenger
 from services.importer import parse_upload_file, infer_column_mapping, normalize_raw_df, rows_to_json_ready
@@ -655,6 +656,7 @@ def forecast_monthly(request: MonthlyForecastRequest):
         'run_id': run_id,
         'run_date': run_date,
         'run_completed_at': completed_at,
+        'actual_sales_reference': 'ignored',
         'source_files': [item.get('file_name') for item in import_files],
         'source_file_count': len(import_files),
         'source_row_count': len(rows),
@@ -930,6 +932,15 @@ def get_latest_actuals():
             },
         }
     )
+
+
+@app.delete('/actuals/latest')
+def delete_latest_actuals():
+    deleted_rows = clear_latest_actual_sales_file()
+    return {
+        'success': True,
+        'deleted_rows': deleted_rows,
+    }
 
 
 @app.post('/forecast/monthly/deviation/calculate')

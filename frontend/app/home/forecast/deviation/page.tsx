@@ -134,9 +134,33 @@ export default function DeviationPage() {
       setMonthRows((body.months || []) as DeviationMonthRow[])
       setDetailRows((body.details || []) as DeviationDetailRow[])
       const run = body.forecast_run || {}
-      setForecastRunText(`预测运行: ${run.run_date || '-'} ${run.created_at || ''}`.trim())
+      setForecastRunText(`最新预测版本: ${run.run_date || '-'} ${run.created_at || ''}`.trim())
     } catch (err) {
       const msg = err instanceof Error ? err.message : '偏差计算失败'
+      setError(msg)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const deleteActualFile = async () => {
+    const ok = typeof window !== 'undefined' ? window.confirm('确认删除当前真实销量数据吗？') : true
+    if (!ok) return
+
+    setLoading(true)
+    setError('')
+    try {
+      const res = await fetch(`${apiBase.replace(/\/$/, '')}/actuals/latest`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail || '删除真实销量失败')
+      }
+      setActualFile(null)
+      setMonthRows([])
+      setDetailRows([])
+      setForecastRunText('')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '删除真实销量失败'
       setError(msg)
     } finally {
       setLoading(false)
@@ -231,7 +255,7 @@ export default function DeviationPage() {
           </div>
         )}
 
-        <section style={{ marginTop: 14, display: 'grid', gap: 12, gridTemplateColumns: '1fr auto auto' }}>
+        <section style={{ marginTop: 14, display: 'grid', gap: 12, gridTemplateColumns: '1fr auto auto auto' }}>
           <input
             value={apiBase}
             onChange={(e) => setApiBase(e.target.value)}
@@ -254,6 +278,14 @@ export default function DeviationPage() {
             title={loading ? '操作进行中，请稍候' : '导入真实销量文件'}
           >
             {uploading ? <Loader2 size={16} /> : <Upload size={16} />} 导入真实销量
+          </button>
+          <button
+            style={ghostButton}
+            disabled={loading || !actualFile}
+            onClick={deleteActualFile}
+            title={actualFile ? '删除当前真实销量数据' : '暂无可删除的真实销量数据'}
+          >
+            删除真实销量
           </button>
         </section>
 

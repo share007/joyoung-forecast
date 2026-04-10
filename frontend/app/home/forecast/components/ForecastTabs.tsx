@@ -5,9 +5,9 @@ import { usePathname } from 'next/navigation'
 import type { CSSProperties } from 'react'
 
 const tabs = [
-  { href: '/home/forecast/dashboard', label: '打开仪表盘' },
-  { href: '/home/forecast/materials', label: '商品基础数据导入' },
+  { href: '/home/forecast/dashboard', label: '运行预测' },
   { href: '/home/forecast/deviation', label: '预测偏差核对' },
+  { href: '/home/forecast/materials', label: '基础数据' },
 ]
 
 export default function ForecastTabs() {

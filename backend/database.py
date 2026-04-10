@@ -673,7 +673,7 @@ def get_monthly_forecast_runs(limit: int = 30) -> List[Dict]:
     cursor.execute(
         '''
         SELECT * FROM monthly_forecast_runs
-        ORDER BY run_date DESC
+        ORDER BY datetime(created_at) DESC, id DESC
         LIMIT ?
         ''',
         (limit,),
@@ -867,6 +867,19 @@ def get_latest_actual_sales_file() -> Optional[Dict]:
     item['rows'] = [dict(x) for x in cursor.fetchall()]
     conn.close()
     return item
+
+
+def clear_latest_actual_sales_file() -> int:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) AS cnt FROM actual_sales_rows')
+    row = cursor.fetchone()
+    total = int(row['cnt']) if row else 0
+    cursor.execute('DELETE FROM actual_sales_rows')
+    cursor.execute('DELETE FROM actual_sales_files')
+    conn.commit()
+    conn.close()
+    return total
 
 
 def get_material_lifecycle_map() -> Dict[str, Dict[str, Optional[str]]]:
