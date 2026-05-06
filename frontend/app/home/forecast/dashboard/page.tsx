@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, ChangeEvent } from 'react'
-import Link from 'next/link'
 import { AlertCircle, Download, Loader2, Trash2, Upload } from 'lucide-react'
 import ForecastTabs from '../components/ForecastTabs'
 
@@ -54,6 +53,7 @@ export default function DashboardPage() {
   const [detected, setDetected] = useState<Record<string, string>>({})
   const [columnMapping, setColumnMapping] = useState({ product_code: '', date: '', sales: '' })
   const [startMonth, setStartMonth] = useState('2026-01')
+  const [cnyAdjustmentStrength, setCnyAdjustmentStrength] = useState('0.98')
   const [importFiles, setImportFiles] = useState<ImportFileRecord[]>([])
   const [forecastRuns, setForecastRuns] = useState<ForecastRun[]>([])
   const [algorithmSummary, setAlgorithmSummary] = useState('')
@@ -214,6 +214,10 @@ export default function DashboardPage() {
         columnMapping.product_code && columnMapping.date && columnMapping.sales
           ? columnMapping
           : undefined
+      const cnyStrength = Number(cnyAdjustmentStrength)
+      if (!Number.isFinite(cnyStrength) || cnyStrength < 0.85 || cnyStrength > 1.05) {
+        throw new Error('春节修正强度应在 0.85-1.05 之间')
+      }
 
       const res = await fetch(`${apiBase.replace(/\/$/, '')}/forecast/monthly`, {
         method: 'POST',
@@ -221,6 +225,7 @@ export default function DashboardPage() {
         body: JSON.stringify({
           forecast_months: 3,
           start_month: startMonth,
+          cny_adjustment_strength: cnyStrength,
           column_mapping: mappingPayload,
         }),
       })
@@ -456,8 +461,19 @@ export default function DashboardPage() {
             style={inputStyle}
             title="预测起始月份（默认 2026-01）"
           />
+          <input
+            type="number"
+            min={0.85}
+            max={1.05}
+            step={0.01}
+            value={cnyAdjustmentStrength}
+            onChange={(e) => setCnyAdjustmentStrength(e.target.value)}
+            style={inputStyle}
+            title="春节修正强度（0.85-1.05）"
+            placeholder="春节修正强度（0.85-1.05）"
+          />
           <button
-            style={primaryButton}
+            style={loading ? { ...primaryButton, ...disabledButtonStyle } : primaryButton}
             onClick={() => fileInputRef.current?.click()}
             disabled={loading}
             title={loading ? '上一次操作未结束，请稍候' : '上传历史销量文件'}
@@ -465,25 +481,28 @@ export default function DashboardPage() {
             {loading ? <Loader2 size={16} /> : <Upload size={16} />} 上传历史销量文件
           </button>
           <button
-            style={accentButton}
+            style={loading ? { ...accentButton, ...disabledButtonStyle } : accentButton}
             onClick={runForecast}
             disabled={loading}
             title={loading ? '上一次操作未结束，请稍候' : '运行月度预测'}
           >
             运行月度预测
           </button>
-          <button style={ghostButton} onClick={exportCsv} disabled={!forecastRuns.length}><Download size={16} /> 导出结果</button>
           <button
-            style={ghostButton}
+            style={!forecastRuns.length ? { ...ghostButton, ...disabledButtonStyle } : ghostButton}
+            onClick={exportCsv}
+            disabled={!forecastRuns.length}
+          >
+            <Download size={16} /> 导出结果
+          </button>
+          <button
+            style={loading || !forecastRuns.length ? { ...ghostButton, ...disabledButtonStyle } : ghostButton}
             onClick={clearForecastRuns}
             disabled={loading || !forecastRuns.length}
             title={loading ? '上一次操作未结束，请稍候' : '清空当前预测结果数据'}
           >
             <Trash2 size={16} /> 清空预测结果
           </button>
-          <Link href="/home/forecast/materials" style={{ ...ghostButton, textDecoration: 'none' }}>
-            商品基础数据管理
-          </Link>
         </section>
 
         <input ref={fileInputRef} type="file" accept=".csv,.xls,.xlsx" onChange={uploadFile} style={{ display: 'none' }} />
@@ -515,7 +534,7 @@ export default function DashboardPage() {
                       <td style={tdStyle}>{file.row_count}</td>
                       <td style={tdStyle}>
                         <button
-                          style={{ ...ghostButton, padding: '6px 10px', cursor: loading ? 'not-allowed' : 'pointer' }}
+                          style={loading ? { ...ghostButton, ...disabledButtonStyle, padding: '6px 10px' } : { ...ghostButton, padding: '6px 10px' }}
                           disabled={loading}
                           onClick={() => void removeImportFile(file.id)}
                         >
@@ -640,6 +659,11 @@ const primaryButton: CSSProperties = {
   gap: 8,
   cursor: 'pointer',
   fontWeight: 700,
+}
+
+const disabledButtonStyle: CSSProperties = {
+  opacity: 0.55,
+  cursor: 'not-allowed',
 }
 
 const accentButton: CSSProperties = {

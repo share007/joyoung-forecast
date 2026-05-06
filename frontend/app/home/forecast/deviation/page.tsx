@@ -53,6 +53,8 @@ export default function DeviationPage() {
   const [actualFile, setActualFile] = useState<ActualFileSummary | null>(null)
   const [monthRows, setMonthRows] = useState<DeviationMonthRow[]>([])
   const [detailRows, setDetailRows] = useState<DeviationDetailRow[]>([])
+  const [cnyMonthRows, setCnyMonthRows] = useState<DeviationMonthRow[]>([])
+  const [cnyDetailRows, setCnyDetailRows] = useState<DeviationDetailRow[]>([])
   const [forecastRunText, setForecastRunText] = useState('')
   const [monthSort, setMonthSort] = useState<{ key: keyof DeviationMonthRow; direction: 'asc' | 'desc' }>({
     key: 'month',
@@ -119,6 +121,10 @@ export default function DeviationPage() {
   }
 
   const calculateDeviation = async () => {
+    if (!actualFile) {
+      setError('请先导入真实销量数据，再进行偏差计算')
+      return
+    }
     setLoading(true)
     setError('')
     try {
@@ -133,6 +139,8 @@ export default function DeviationPage() {
       const body = await res.json()
       setMonthRows((body.months || []) as DeviationMonthRow[])
       setDetailRows((body.details || []) as DeviationDetailRow[])
+      setCnyMonthRows((body.cny_months || []) as DeviationMonthRow[])
+      setCnyDetailRows((body.cny_details || []) as DeviationDetailRow[])
       const run = body.forecast_run || {}
       setForecastRunText(`最新预测版本: ${run.run_date || '-'} ${run.created_at || ''}`.trim())
     } catch (err) {
@@ -158,6 +166,8 @@ export default function DeviationPage() {
       setActualFile(null)
       setMonthRows([])
       setDetailRows([])
+      setCnyMonthRows([])
+      setCnyDetailRows([])
       setForecastRunText('')
     } catch (err) {
       const msg = err instanceof Error ? err.message : '删除真实销量失败'
@@ -272,7 +282,7 @@ export default function DeviationPage() {
             刷新
           </button>
           <button
-            style={primaryButton}
+            style={loading ? { ...primaryButton, ...disabledButtonStyle } : primaryButton}
             disabled={loading}
             onClick={() => fileInputRef.current?.click()}
             title={loading ? '操作进行中，请稍候' : '导入真实销量文件'}
@@ -280,7 +290,7 @@ export default function DeviationPage() {
             {uploading ? <Loader2 size={16} /> : <Upload size={16} />} 导入真实销量
           </button>
           <button
-            style={ghostButton}
+            style={loading || !actualFile ? { ...ghostButton, ...disabledButtonStyle } : ghostButton}
             disabled={loading || !actualFile}
             onClick={deleteActualFile}
             title={actualFile ? '删除当前真实销量数据' : '暂无可删除的真实销量数据'}
@@ -301,13 +311,59 @@ export default function DeviationPage() {
 
           <div style={{ marginTop: 12 }}>
             <button
-              style={accentButton}
-              disabled={loading}
+              style={loading || !actualFile ? { ...accentButton, ...disabledButtonStyle } : accentButton}
+              disabled={loading || !actualFile}
               onClick={calculateDeviation}
-              title={loading ? '操作进行中，请稍候' : '根据最新预测与最新真实数据计算偏差'}
+              title={
+                loading
+                  ? '操作进行中，请稍候'
+                  : actualFile
+                    ? '根据最新预测与最新真实数据计算偏差'
+                    : '请先导入真实销量数据'
+              }
             >
               {loading ? <Loader2 size={16} /> : <Calculator size={16} />} 偏差计算
             </button>
+            {!actualFile && <p style={{ margin: '8px 0 0', color: 'var(--jy-muted, #7f6a4a)', fontSize: 13 }}>请先导入真实销量数据。</p>}
+          </div>
+        </section>
+
+        <section className="card" style={{ marginTop: 14, borderRadius: 12, padding: 12 }}>
+          <h3 style={{ marginTop: 0 }}>春节窗口单独误差</h3>
+          <p style={{ marginTop: 0, color: 'var(--jy-muted, #7f6a4a)', fontSize: 13 }}>
+            统计春节窗口(月份由节日日期自动识别，通常为 1-2 月)的误差，便于单独校验春节影响。
+          </p>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ background: 'var(--jy-surface-soft, #fff6ea)' }}>
+                  <th style={thStyle}>月份</th>
+                  <th style={thStyle}>真实销量</th>
+                  <th style={thStyle}>预测销量</th>
+                  <th style={thStyle}>差异量(预测-真实)</th>
+                  <th style={thStyle}>差异率</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cnyMonthRows.map((row) => (
+                  <tr key={`cny-${row.month}`} style={{ borderTop: '1px solid var(--jy-border, #efd8b0)' }}>
+                    <td style={tdStyle}>{row.month}</td>
+                    <td style={tdStyle}>{row.actual_sales}</td>
+                    <td style={tdStyle}>{row.forecast_sales}</td>
+                    <td style={tdStyle}>{row.difference}</td>
+                    <td style={tdStyle}>{formatRate(row.difference_rate)}</td>
+                  </tr>
+                ))}
+                {!cnyMonthRows.length && (
+                  <tr>
+                    <td style={tdStyle} colSpan={5}>暂无春节窗口偏差结果</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop: 10, color: 'var(--jy-muted, #7f6a4a)', fontSize: 13 }}>
+            春节窗口明细条数: {cnyDetailRows.length}
           </div>
         </section>
 
@@ -316,7 +372,7 @@ export default function DeviationPage() {
           {forecastRunText && <p style={{ marginTop: 0, color: 'var(--jy-muted, #7f6a4a)' }}>{forecastRunText}</p>}
           <div style={{ marginBottom: 10 }}>
             <button
-              style={ghostButton}
+              style={loading || (!sortedMonthRows.length && !sortedDetailRows.length) ? { ...ghostButton, ...disabledButtonStyle } : ghostButton}
               disabled={loading || (!sortedMonthRows.length && !sortedDetailRows.length)}
               onClick={exportDeviationExcel}
               title={sortedMonthRows.length || sortedDetailRows.length ? '导出月度偏差和产品明细偏差到同一个Excel文件' : '暂无可导出数据'}
@@ -417,6 +473,11 @@ const primaryButton: CSSProperties = {
 const accentButton: CSSProperties = {
   ...primaryButton,
   background: 'linear-gradient(135deg, #dc7f00, #f39800)',
+}
+
+const disabledButtonStyle: CSSProperties = {
+  opacity: 0.55,
+  cursor: 'not-allowed',
 }
 
 const ghostButton: CSSProperties = {

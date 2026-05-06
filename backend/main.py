@@ -33,7 +33,7 @@ from database import (
 )
 from services.forecasting import forecast_with_champion_challenger
 from services.importer import parse_upload_file, infer_column_mapping, normalize_raw_df, rows_to_json_ready
-from services.monthly_forecasting import forecast_next_months
+from services.monthly_forecasting import forecast_next_months, resolve_cny_months
 from services.planning import PlanningInput, build_recommendation
 import pandas as pd
 import numpy as np
@@ -82,6 +82,7 @@ class MonthlyForecastRequest(BaseModel):
     forecast_months: int = 3
     column_mapping: Optional[dict] = None
     start_month: Optional[str] = None
+    cny_adjustment_strength: float = 0.98
 
 
 class MaterialLifecycleItem(BaseModel):
@@ -610,6 +611,8 @@ def forecast_monthly(request: MonthlyForecastRequest):
     """基于所有未删除导入数据，输出未来N个月的 产品编码-月份-销量 预测。"""
     if request.forecast_months < 1 or request.forecast_months > 12:
         raise HTTPException(status_code=400, detail='forecast_months 应在 1-12 之间')
+    if request.cny_adjustment_strength < 0.85 or request.cny_adjustment_strength > 1.05:
+        raise HTTPException(status_code=400, detail='cny_adjustment_strength 应在 0.85-1.05 之间')
 
     import_files = list_import_files(limit=1000)
     if not import_files:
@@ -619,6 +622,9 @@ def forecast_monthly(request: MonthlyForecastRequest):
     if not rows:
         raise HTTPException(status_code=400, detail='当前导入文件没有可用数据')
 
+    latest_actual = get_latest_actual_sales_file()
+    actual_rows = latest_actual.get('rows', []) if latest_actual else None
+
     try:
         lifecycle_map = get_material_lifecycle_map()
         output = forecast_next_months(
@@ -627,6 +633,8 @@ def forecast_monthly(request: MonthlyForecastRequest):
             column_mapping=request.column_mapping,
             lifecycle_map=lifecycle_map,
             start_month=request.start_month,
+            cny_adjustment_strength=request.cny_adjustment_strength,
+            actual_rows=actual_rows,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -662,6 +670,7 @@ def forecast_monthly(request: MonthlyForecastRequest):
         'source_row_count': len(rows),
         'forecast_months': request.forecast_months,
         'start_month': request.start_month,
+        'cny_adjustment_strength': request.cny_adjustment_strength,
         'mapping': output.mapping,
         'algorithm': algorithm,
         'metrics': output.metrics,
@@ -984,6 +993,15 @@ def calculate_monthly_deviation():
             }
         )
 
+    cny_years = []
+    for month in months:
+        try:
+            cny_years.append(int(str(month).split('-')[0]))
+        except Exception:
+            continue
+    cny_month_set = resolve_cny_months(cny_years)
+    cny_month_rows = [row for row in month_rows if str(row.get('month')) in cny_month_set]
+
     # Detailed product-month deviation rows (for debugging/traceability)
     actual_map = {
         (str(item.get('product_code')), str(item.get('month'))): float(item.get('sales', 0) or 0)
@@ -1006,6 +1024,7 @@ def calculate_monthly_deviation():
                 'difference_rate': round(r, 6) if r is not None else None,
             }
         )
+    cny_detail_rows = [row for row in detail_rows if str(row.get('month')) in cny_month_set]
 
     return _json_safe(
         {
@@ -1022,6 +1041,8 @@ def calculate_monthly_deviation():
             },
             'months': month_rows,
             'details': detail_rows,
+            'cny_months': cny_month_rows,
+            'cny_details': cny_detail_rows,
         }
     )
 

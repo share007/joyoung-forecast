@@ -25,6 +25,36 @@ class MonthlyForecastOutput:
     rows: List[Dict]
 
 
+@dataclass
+class CnyMonthlyProfile:
+    cny_factor: float
+    post_cny_factor: float
+    cny_month_map: Dict[int, str]
+    post_cny_month_map: Dict[int, str]
+    history_years: List[int]
+    history_cny_ratio_samples: List[float]
+    history_post_ratio_samples: List[float]
+    actual_year: Optional[int]
+    actual_cny_ratio: Optional[float]
+    actual_post_ratio: Optional[float]
+
+
+def _profile_to_summary(profile: CnyMonthlyProfile) -> Dict:
+    return {
+        "cny_monthly_factor": round(profile.cny_factor, 4),
+        "post_cny_monthly_factor": round(profile.post_cny_factor, 4),
+        "cny_month_map": profile.cny_month_map,
+        "post_cny_month_map": profile.post_cny_month_map,
+        "history_cny_ratio_samples": profile.history_cny_ratio_samples,
+        "history_post_cny_ratio_samples": profile.history_post_ratio_samples,
+        "actual_calibration": {
+            "year": profile.actual_year,
+            "cny_ratio": profile.actual_cny_ratio,
+            "post_cny_ratio": profile.actual_post_ratio,
+        },
+    }
+
+
 def _wmape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     denom = np.abs(y_true).sum()
     if denom == 0:
@@ -89,6 +119,317 @@ def _build_spring_festival_dates(years: List[int]) -> set[dt_date]:
         if "春节" in text or "Chinese New Year" in text or "Spring Festival" in text or "Lunar New Year" in text:
             spring_dates.add(d)
     return spring_dates
+
+
+def resolve_cny_months(years: List[int]) -> set[str]:
+    years = sorted({int(y) for y in years if y})
+    if not years:
+        return set()
+
+    spring_dates = _build_spring_festival_dates(years)
+    if not spring_dates:
+        # Fallback approximation: CNY usually falls in Jan/Feb.
+        return {f"{y}-01" for y in years} | {f"{y}-02" for y in years}
+
+    months: set[str] = set()
+    for sf in spring_dates:
+        start = sf - timedelta(days=10)
+        end = sf + timedelta(days=10)
+        cursor = start
+        while cursor <= end:
+            months.add(f"{cursor.year}-{cursor.month:02d}")
+            cursor += timedelta(days=1)
+    return months
+
+
+def _build_cny_month_map(years: List[int]) -> Dict[int, str]:
+    year_list = sorted({int(y) for y in years if y})
+    if not year_list:
+        return {}
+
+    spring_dates = _build_spring_festival_dates(year_list)
+    if not spring_dates:
+        return {y: f"{y}-02" for y in year_list}
+
+    mapping: Dict[int, str] = {}
+    for y in year_list:
+        counts: Dict[str, int] = {}
+        year_spring_dates = [d for d in spring_dates if d.year == y]
+        for sf in year_spring_dates:
+            start = sf - timedelta(days=10)
+            end = sf + timedelta(days=10)
+            cursor = start
+            while cursor <= end:
+                if cursor.year == y:
+                    key = f"{cursor.year}-{cursor.month:02d}"
+                    counts[key] = counts.get(key, 0) + 1
+                cursor += timedelta(days=1)
+
+        if counts:
+            mapping[y] = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[0][0]
+        else:
+            mapping[y] = f"{y}-02"
+
+    return mapping
+
+
+def _next_month_str(month_str: str) -> str:
+    p = pd.Period(month_str, freq="M")
+    return str(p + 1)
+
+
+def _prev_month_str(month_str: str) -> str:
+    p = pd.Period(month_str, freq="M")
+    return str(p - 1)
+
+
+def _monthly_ratio_samples(
+    month_sales: Dict[str, float],
+    cny_month_map: Dict[int, str],
+) -> Tuple[List[float], List[float]]:
+    cny_samples: List[float] = []
+    post_samples: List[float] = []
+
+    for year, cny_month in sorted(cny_month_map.items()):
+        cny_val = float(month_sales.get(cny_month, 0.0))
+        if cny_val <= 0:
+            continue
+
+        prev_month = _prev_month_str(cny_month)
+        post_month = _next_month_str(cny_month)
+        prev_val = float(month_sales.get(prev_month, 0.0))
+        post_val = float(month_sales.get(post_month, 0.0))
+
+        baseline_candidates = [v for v in [prev_val, post_val] if v > 0]
+        if not baseline_candidates:
+            continue
+
+        baseline = float(np.mean(baseline_candidates))
+        if baseline <= 0:
+            continue
+
+        cny_samples.append(float(np.clip(cny_val / baseline, 0.35, 1.2)))
+        post_samples.append(float(np.clip(post_val / baseline if post_val > 0 else 1.0, 0.7, 1.6)))
+
+    return cny_samples, post_samples
+
+
+def _estimate_cny_monthly_profile(
+    history: pd.DataFrame,
+    cny_adjustment_strength: float,
+    actual_rows: Optional[List[Dict]] = None,
+    target_years: Optional[List[int]] = None,
+) -> CnyMonthlyProfile:
+    work = history[["date", "sales"]].copy()
+    work["period"] = work["date"].dt.to_period("M").astype(str)
+    month_sales_hist = {
+        str(k): float(v)
+        for k, v in work.groupby("period")["sales"].sum().to_dict().items()
+    }
+
+    history_years = sorted({int(p[:4]) for p in month_sales_hist.keys() if re.match(r"^\d{4}-\d{2}$", p)})
+    base_years = history_years + [int(y) for y in (target_years or []) if y]
+    cny_month_map = _build_cny_month_map(base_years)
+    post_cny_month_map = {y: _next_month_str(m) for y, m in cny_month_map.items()}
+
+    hist_cny_samples, hist_post_samples = _monthly_ratio_samples(month_sales_hist, cny_month_map)
+    hist_cny = float(np.median(hist_cny_samples)) if hist_cny_samples else 0.88
+    hist_post = float(np.median(hist_post_samples)) if hist_post_samples else 1.08
+
+    actual_year: Optional[int] = None
+    actual_cny_ratio: Optional[float] = None
+    actual_post_ratio: Optional[float] = None
+
+    if actual_rows:
+        actual_month_sales: Dict[str, float] = {}
+        for row in actual_rows:
+            month = str(row.get("month", "")).strip()
+            sales = float(row.get("sales", 0) or 0)
+            if not re.match(r"^\d{4}-\d{2}$", month):
+                continue
+            actual_month_sales[month] = actual_month_sales.get(month, 0.0) + max(0.0, sales)
+
+        actual_years = sorted({int(m[:4]) for m in actual_month_sales.keys()})
+        if actual_years:
+            actual_year = actual_years[-1]
+            merged_map = _build_cny_month_map(base_years + actual_years)
+            actual_map = {actual_year: merged_map.get(actual_year, f"{actual_year}-02")}
+            cny_samples, post_samples = _monthly_ratio_samples(actual_month_sales, actual_map)
+            if cny_samples:
+                actual_cny_ratio = float(np.median(cny_samples))
+            if post_samples:
+                actual_post_ratio = float(np.median(post_samples))
+
+    # Blend long-term history with the latest actual year when available.
+    if actual_cny_ratio is not None:
+        cny_base = 0.55 * hist_cny + 0.45 * actual_cny_ratio
+    else:
+        cny_base = hist_cny
+
+    if actual_post_ratio is not None:
+        post_base = 0.55 * hist_post + 0.45 * actual_post_ratio
+    else:
+        post_base = hist_post
+
+    cny_factor = float(np.clip(cny_base * float(cny_adjustment_strength), 0.35, 1.05))
+    post_cny_factor = float(np.clip(post_base * (2.0 - float(cny_adjustment_strength)), 0.85, 1.5))
+
+    return CnyMonthlyProfile(
+        cny_factor=cny_factor,
+        post_cny_factor=post_cny_factor,
+        cny_month_map=cny_month_map,
+        post_cny_month_map=post_cny_month_map,
+        history_years=history_years,
+        history_cny_ratio_samples=[round(v, 4) for v in hist_cny_samples],
+        history_post_ratio_samples=[round(v, 4) for v in hist_post_samples],
+        actual_year=actual_year,
+        actual_cny_ratio=round(actual_cny_ratio, 4) if actual_cny_ratio is not None else None,
+        actual_post_ratio=round(actual_post_ratio, 4) if actual_post_ratio is not None else None,
+    )
+
+
+def _detect_group_column(data: pd.DataFrame, cat_cols: List[str]) -> Optional[str]:
+    candidates = [col for col in cat_cols if col in data.columns]
+    if not candidates:
+        return None
+
+    ranked_patterns = [
+        r"channel|渠道|渠道类型|店铺渠道|platform",
+        r"category|品类|类目|品线|系列",
+    ]
+    for pat in ranked_patterns:
+        for col in candidates:
+            if re.search(pat, str(col).lower()):
+                return col
+
+    # Fallback: choose the most stable low-cardinality categorical feature.
+    best_col = None
+    best_score = -1.0
+    for col in candidates:
+        non_na = data[col].dropna().astype(str)
+        if non_na.empty:
+            continue
+        nunique = int(non_na.nunique())
+        if nunique <= 1 or nunique > 30:
+            continue
+        score = float(len(non_na)) / float(nunique)
+        if score > best_score:
+            best_score = score
+            best_col = col
+    return best_col
+
+
+def _build_product_group_map(data: pd.DataFrame, group_col: Optional[str]) -> Dict[str, str]:
+    if not group_col or group_col not in data.columns:
+        return {}
+
+    subset = data[["product_code", group_col]].copy()
+    subset["product_code"] = subset["product_code"].astype(str)
+    subset[group_col] = subset[group_col].astype(str).str.strip()
+    subset = subset[subset[group_col] != ""]
+    if subset.empty:
+        return {}
+
+    group_map: Dict[str, str] = {}
+    for code, grp in subset.groupby("product_code"):
+        mode = grp[group_col].mode()
+        if mode.empty:
+            continue
+        group_map[str(code)] = str(mode.iloc[0])
+    return group_map
+
+
+def _estimate_grouped_cny_profiles(
+    history: pd.DataFrame,
+    cny_adjustment_strength: float,
+    actual_rows: Optional[List[Dict]] = None,
+    product_group_map: Optional[Dict[str, str]] = None,
+    target_years: Optional[List[int]] = None,
+) -> Tuple[CnyMonthlyProfile, Dict[str, CnyMonthlyProfile]]:
+    global_profile = _estimate_cny_monthly_profile(
+        history=history,
+        cny_adjustment_strength=cny_adjustment_strength,
+        actual_rows=actual_rows,
+        target_years=target_years,
+    )
+
+    if not product_group_map:
+        return global_profile, {}
+
+    grouped: Dict[str, CnyMonthlyProfile] = {}
+    all_actual_rows = actual_rows or []
+    group_names = sorted({g for g in product_group_map.values() if g})
+    for group_name in group_names:
+        code_set = {code for code, g in product_group_map.items() if g == group_name}
+        if not code_set:
+            continue
+
+        group_history = history[history["product_code"].astype(str).isin(code_set)]
+        if group_history.empty:
+            continue
+
+        if group_history["date"].dt.to_period("M").nunique() < 6:
+            continue
+
+        group_actual_rows = [
+            row for row in all_actual_rows
+            if str(row.get("product_code", "")) in code_set
+        ]
+        grouped[group_name] = _estimate_cny_monthly_profile(
+            history=group_history,
+            cny_adjustment_strength=cny_adjustment_strength,
+            actual_rows=group_actual_rows,
+            target_years=target_years,
+        )
+
+    return global_profile, grouped
+
+
+def _pick_profile_for_code(
+    product_code: str,
+    default_profile: CnyMonthlyProfile,
+    product_group_map: Optional[Dict[str, str]] = None,
+    grouped_profiles: Optional[Dict[str, CnyMonthlyProfile]] = None,
+) -> CnyMonthlyProfile:
+    if not product_group_map or not grouped_profiles:
+        return default_profile
+
+    group_name = product_group_map.get(str(product_code))
+    if not group_name:
+        return default_profile
+    return grouped_profiles.get(group_name, default_profile)
+
+
+def _apply_monthly_profile_to_rows(
+    rows: List[Dict],
+    default_profile: CnyMonthlyProfile,
+    product_group_map: Optional[Dict[str, str]] = None,
+    grouped_profiles: Optional[Dict[str, CnyMonthlyProfile]] = None,
+) -> List[Dict]:
+    out: List[Dict] = []
+    for row in rows:
+        code = str(row.get("product_code", ""))
+        month_key = str(row.get("month", ""))
+        profile = _pick_profile_for_code(
+            product_code=code,
+            default_profile=default_profile,
+            product_group_map=product_group_map,
+            grouped_profiles=grouped_profiles,
+        )
+
+        factor = 1.0
+        if month_key in set(profile.cny_month_map.values()):
+            factor *= float(profile.cny_factor)
+        elif month_key in set(profile.post_cny_month_map.values()):
+            factor *= float(profile.post_cny_factor)
+
+        adjusted = dict(row)
+        if factor != 1.0:
+            adjusted["sales"] = round(max(0.0, float(adjusted.get("sales", 0.0)) * factor), 2)
+            adjusted["lower_bound"] = round(max(0.0, float(adjusted.get("lower_bound", 0.0)) * factor), 2)
+            adjusted["upper_bound"] = round(max(0.0, float(adjusted.get("upper_bound", 0.0)) * factor), 2)
+        out.append(adjusted)
+    return out
 
 
 def _in_cny_window(d: dt_date, spring_dates: set[dt_date]) -> bool:
@@ -444,7 +785,15 @@ def _predict_lgbm_daily(
     return full[full["date"] >= start][["product_code", "date", "sales"]]
 
 
-def _predict_baseline_daily(history: pd.DataFrame, start_month: pd.Period, forecast_months: int) -> pd.DataFrame:
+def _predict_baseline_daily(
+    history: pd.DataFrame,
+    start_month: pd.Period,
+    forecast_months: int,
+    cny_adjustment_strength: float,
+    cny_profile: Optional[CnyMonthlyProfile] = None,
+    product_group_map: Optional[Dict[str, str]] = None,
+    grouped_profiles: Optional[Dict[str, CnyMonthlyProfile]] = None,
+) -> pd.DataFrame:
     start_month_ts = start_month.to_timestamp()
     end = (start_month + (forecast_months - 1)).to_timestamp(how="end").normalize()
     horizon_years = list(range(int(start_month.year) - 1, int((start_month + (forecast_months - 1)).year) + 2))
@@ -452,6 +801,7 @@ def _predict_baseline_daily(history: pd.DataFrame, start_month: pd.Period, forec
 
     out: List[Dict] = []
     event_factors = _estimate_daily_event_factors(history)
+
     for code, grp in history.groupby("product_code"):
         grp = grp.sort_values("date")
         values = grp["sales"].to_numpy(dtype=float)
@@ -478,22 +828,50 @@ def _predict_baseline_daily(history: pd.DataFrame, start_month: pd.Period, forec
 
         for i, v in enumerate(preds):
             day = (start + pd.Timedelta(days=i)).date()
+            month_key = f"{day.year}-{day.month:02d}"
             factor = 1.0
             code_factors = event_factors.get(str(code), {})
+            active_profile = _pick_profile_for_code(
+                product_code=str(code),
+                default_profile=cny_profile if cny_profile else CnyMonthlyProfile(1.0, 1.0, {}, {}, [], [], [], None, None, None),
+                product_group_map=product_group_map,
+                grouped_profiles=grouped_profiles,
+            )
+            cny_month_set = set(active_profile.cny_month_map.values())
+            post_cny_month_set = set(active_profile.post_cny_month_map.values())
             if _in_618_window(day):
                 factor *= float(code_factors.get("promo_618", 1.05))
             if _in_double11_window(day):
                 factor *= float(code_factors.get("promo_double11", 1.08))
             if _in_cny_window(day, spring_dates):
-                factor *= float(code_factors.get("cny", 0.9))
+                factor *= float(code_factors.get("cny", 0.9)) * float(cny_adjustment_strength)
+            if month_key in cny_month_set:
+                factor *= float(active_profile.cny_factor)
+            elif month_key in post_cny_month_set:
+                factor *= float(active_profile.post_cny_factor)
             out.append({"product_code": str(code), "date": start + pd.Timedelta(days=i), "sales": max(0.0, float(v) * factor)})
 
     return pd.DataFrame(out)
 
 
-def _predict_baseline_monthly(history: pd.DataFrame, start_month: pd.Period, forecast_months: int) -> List[Dict]:
+def _predict_baseline_monthly(
+    history: pd.DataFrame,
+    start_month: pd.Period,
+    forecast_months: int,
+    cny_adjustment_strength: float,
+    actual_rows: Optional[List[Dict]] = None,
+    default_cny_profile: Optional[CnyMonthlyProfile] = None,
+    product_group_map: Optional[Dict[str, str]] = None,
+    grouped_profiles: Optional[Dict[str, CnyMonthlyProfile]] = None,
+) -> List[Dict]:
     month_range = pd.period_range(start_month, start_month + (forecast_months - 1), freq="M")
+    cny_months = resolve_cny_months([int(p.year) for p in month_range])
     rows: List[Dict] = []
+    cny_profile = default_cny_profile or _estimate_cny_monthly_profile(
+        history=history,
+        cny_adjustment_strength=cny_adjustment_strength,
+        actual_rows=actual_rows,
+    )
 
     for code, grp in history.groupby("product_code"):
         grp = grp.sort_values("date").copy()
@@ -532,8 +910,23 @@ def _predict_baseline_monthly(history: pd.DataFrame, start_month: pd.Period, for
                 val *= max(1.02, float((month_index.get(5, 1.0) + month_index.get(6, 1.0)) / 2.0))
             if m in (10, 11):
                 val *= max(1.02, float((month_index.get(10, 1.0) + month_index.get(11, 1.0)) / 2.0))
-            if m in (1, 2):
-                val *= min(0.98, float((month_index.get(1, 1.0) + month_index.get(2, 1.0)) / 2.0))
+            if str(month) in cny_months:
+                cny_base = float((month_index.get(1, 1.0) + month_index.get(2, 1.0)) / 2.0)
+                val *= min(float(cny_adjustment_strength), cny_base)
+
+            month_key = str(month)
+            active_profile = _pick_profile_for_code(
+                product_code=str(code),
+                default_profile=cny_profile,
+                product_group_map=product_group_map,
+                grouped_profiles=grouped_profiles,
+            )
+            cny_month_set = set(active_profile.cny_month_map.values())
+            post_cny_month_set = set(active_profile.post_cny_month_map.values())
+            if month_key in cny_month_set:
+                val *= float(active_profile.cny_factor)
+            elif month_key in post_cny_month_set:
+                val *= float(active_profile.post_cny_factor)
 
             month_sales[month] = max(0.0, float(val))
             step = idx + 1
@@ -644,6 +1037,8 @@ def forecast_next_months(
     column_mapping: Optional[Dict[str, str]] = None,
     lifecycle_map: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
     start_month: Optional[str] = None,
+    cny_adjustment_strength: float = 0.98,
+    actual_rows: Optional[List[Dict]] = None,
 ) -> MonthlyForecastOutput:
     # Business requirement fixed at 3 months by default.
     forecast_months = 3 if forecast_months <= 0 else forecast_months
@@ -655,11 +1050,30 @@ def forecast_next_months(
         lifecycle_map=lifecycle_map,
     )
 
+    history_core = daily[["product_code", "date", "sales"]]
+    forecast_month_range = pd.period_range(start_month_period, start_month_period + (forecast_months - 1), freq="M")
+    target_years = [int(p.year) for p in forecast_month_range]
+    group_col = _detect_group_column(daily, cat_cols)
+    product_group_map = _build_product_group_map(daily, group_col)
+    cny_profile, grouped_profiles = _estimate_grouped_cny_profiles(
+        history=history_core,
+        cny_adjustment_strength=cny_adjustment_strength,
+        actual_rows=actual_rows,
+        product_group_map=product_group_map,
+        target_years=target_years,
+    )
+    grouped_profile_summary = {name: _profile_to_summary(profile) for name, profile in grouped_profiles.items()}
+
     if granularity == "monthly":
         rows = _predict_baseline_monthly(
-            history=daily[["product_code", "date", "sales"]],
+            history=history_core,
             start_month=start_month_period,
             forecast_months=forecast_months,
+            cny_adjustment_strength=cny_adjustment_strength,
+            actual_rows=actual_rows,
+            default_cny_profile=cny_profile,
+            product_group_map=product_group_map,
+            grouped_profiles=grouped_profiles,
         )
 
         if lifecycle_map:
@@ -712,6 +1126,11 @@ def forecast_next_months(
                     "promo_618_window": "05-20 to 06-20",
                     "promo_double11_window": "10-20 to 11-11",
                     "cny_window": "dynamic lunar new year period",
+                    "cny_adjustment_strength": cny_adjustment_strength,
+                    "group_dimension": group_col,
+                    "group_count": len(grouped_profiles),
+                    "group_profiles": grouped_profile_summary,
+                    **_profile_to_summary(cny_profile),
                 },
                 "candidates": [{"method": "monthly_baseline", "wmape": None}],
             },
@@ -739,9 +1158,13 @@ def forecast_next_months(
         lgb_metric = {"method": "global_lightgbm_daily", "wmape": 999.0, "status": "not_available"}
 
     pred_base = _predict_baseline_daily(
-        daily[["product_code", "date", "sales"]],
+        history_core,
         start_month=start_month_period,
         forecast_months=forecast_months,
+        cny_adjustment_strength=cny_adjustment_strength,
+        cny_profile=cny_profile,
+        product_group_map=product_group_map,
+        grouped_profiles=grouped_profiles,
     )
 
     lgb_eval = lgb_metric
@@ -759,11 +1182,19 @@ def forecast_next_months(
     selected_daily = pred_lgb if use_lgb else pred_base
 
     rows = _aggregate_monthly(
-        daily[["product_code", "date", "sales"]],
+        history_core,
         selected_daily,
         start_month=start_month_period,
         forecast_months=forecast_months,
     )
+
+    if use_lgb:
+        rows = _apply_monthly_profile_to_rows(
+            rows=rows,
+            default_profile=cny_profile,
+            product_group_map=product_group_map,
+            grouped_profiles=grouped_profiles,
+        )
 
     if lifecycle_map:
         adjusted_rows: List[Dict] = []
@@ -814,6 +1245,11 @@ def forecast_next_months(
                 "promo_618_window": "05-20 to 06-20",
                 "promo_double11_window": "10-20 to 11-11",
                 "cny_window": "dynamic lunar new year period",
+                "cny_adjustment_strength": cny_adjustment_strength,
+                "group_dimension": group_col,
+                "group_count": len(grouped_profiles),
+                "group_profiles": grouped_profile_summary,
+                **_profile_to_summary(cny_profile),
             },
             "input_granularity": granularity,
             "candidates": [base_eval, lgb_eval],
